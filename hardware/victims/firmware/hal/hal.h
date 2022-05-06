@@ -56,6 +56,7 @@ void platform_init(void);
 #define CW308_RX65N  34
 #define CW308_MPC5676R 35
 #define CW308_NEORV32  36
+#define CW308_EFM32GG12  37
 
 //HAL_TYPE Define Types
 #define HAL_avr      1
@@ -86,6 +87,7 @@ void platform_init(void);
 #define HAL_rx65n 26
 #define HAL_mpc5676r 27
 #define HAL_neorv32  28
+#define HAL_efm32gg12 29
 
 #if HAL_TYPE == HAL_avr
     #include <avr/io.h>
@@ -153,6 +155,8 @@ void platform_init(void);
     #include "mpc5676r/MPC5676R_hal.h"
 #elif HAL_TYPE == HAL_neorv32
     #include "neorv32/neorv32_hal.h"
+#elif HAL_TYPE == HAL_efm32gg12
+    #include "efm32gg12/efm32gg12_hal.h"
 #else
     #error "Unsupported HAL Type"
 #endif
