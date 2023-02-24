@@ -37,14 +37,15 @@ from .CW305 import CW305
 from .SimpleSerial2 import SimpleSerial2, SimpleSerial2_CDC
 from .CW305_ECC import CW305_ECC
 from .CW310 import CW310
+from .CW340 import CW340
 from typing import Union
 
-try:
-    from .sakura_g import SakuraG #needs ftdi module
-except ImportError:
-    pass
+# try:
+#     from .sakura_g import SakuraG #needs ftdi module
+# except ImportError:
+#     pass
 
 # from .SmartCard import SmartCard #Tied to GUI
 SimpleSerialTypes = Union[SimpleSerial, SimpleSerial2, SimpleSerial2_CDC]
-FPGATypes = Union[CW305, CW305_ECC, CW310]
+FPGATypes = Union[CW305, CW305_ECC, CW310, CW340]
 TargetTypes = Union[FPGATypes, SimpleSerialTypes]

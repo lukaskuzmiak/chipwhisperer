@@ -45,6 +45,10 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
     The target is automatically connected to if the default configuration
     adequate.
 
+    A `noflush=True` kwarg may be used to suppress an initial protocol-specific
+    flush of the UART. The caller is then responsible for invoking flush() manually
+    to flush underlying buffers.
+
     For more help use the help() function with one of the submodules
     (target.baud, target.write, target.read, ...).
 
@@ -117,7 +121,11 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
 
     @property
     def output_len(self):
-        """The length of the output expected from the crypto algorithm (in bytes)"""
+        """The length of the output expected from the crypto algorithm (in bytes):
+        
+        :meta private:
+        
+        """
         return self._output_len
 
     @output_len.setter
@@ -151,29 +159,42 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
     @property
     def protver(self):
         """Get the protocol version used for the target
+
+        :meta private:
         """
         return self._proto_ver
 
     @protver.setter
     def protver(self, value):
         """Set the protocol version used for the target ('1.1', '1.0', or 'auto')
+
         """
         self._proto_ver = value
 
 
     def setConnection(self, con):
-        """I don't think this does anything"""
+        """I don't think this does anything
+        
+        :meta private:
+
+        """
         self.ser = con
         self.ser.connectStatus = self.connectStatus
         self.ser.selectionChanged()
 
-    def _con(self, scope = None):
+    def _con(self, scope = None, **kwargs):
         if not scope or not hasattr(scope, "qtadc"): Warning("You need a scope with OpenADC connected to use this Target")
 
         self.ser.con(scope)
-        # 'x' flushes everything & sets system back to idle
-        self.ser.write("xxxxxxxxxxxxxxxxxxxxxxxx")
-        self.ser.flush()
+
+        # Check to see if the caller wants to be responsible for flushing the
+        # UART on connect. For real world targets, we may just want to quietly
+        # open serial port without sending "xxx..." at a potentially incorrect
+        # baud rate.
+        if kwargs.get('noflush', False) == False:
+            # 'x' flushes everything & sets system back to idle
+            self.ser.write("xxxxxxxxxxxxxxxxxxxxxxxx")
+            self.ser.flush()
 
     def dis(self):
         self.close()
@@ -229,6 +250,8 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         .. versionadded:: 5.1
             Added target.write()
         """
+        if type(data) is list:
+            data = bytearray(data)
         if not self.connectStatus:
             raise Warning("Target not connected")
 
@@ -328,6 +351,8 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         .. versionadded:: 5.1
             Added target.simpleserial_write()
         """
+        if type(num) is list:
+            num = bytearray(num)
         self.ser.flush()
         if cmd:
             cmd += binascii.hexlify(num).decode()
@@ -499,7 +524,7 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         self._simpleserial_last_read = response
         return {'valid': valid, 'payload': payload, 'full_response': response, 'rv': rv}
 
-    def set_key(self, key, ack=True, timeout=250):
+    def set_key(self, key, ack=True, timeout=250, always_send=False):
         """Checks if key is different than the last one sent. If so, send it.
 
         Uses simpleserial_write('k')
@@ -517,7 +542,7 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         .. versionadded:: 5.1
             Added target.set_key()
         """
-        if self.last_key != key:
+        if (self.last_key != key) or always_send:
             self.last_key = key
             self.simpleserial_write('k', key)
             if ack:

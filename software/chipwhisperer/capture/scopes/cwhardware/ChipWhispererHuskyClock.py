@@ -1,10 +1,12 @@
 # from _typeshed import OpenBinaryMode
+from multiprocessing.sharedctypes import Value
 from ....common.utils.util import dict_to_str, DelayedKeyboardInterrupt
 from ....common.utils import util
 from ....logging import *
 import numpy as np
 from .._OpenADCInterface import OpenADCInterface, ClockSettings
 
+ADDR_EXTCLK                     = 38
 ADDR_EXTCLK_CHANGE_LIMIT        = 82
 ADDR_EXTCLK_MONITOR_DISABLED    = 83
 ADDR_EXTCLK_MONITOR_STAT        = 84
@@ -45,6 +47,7 @@ class CDCI6214:
         self._glitch = None
         self._cached_adc_freq = None
         self._max_freq = 300e6
+        self._warning_freq = 201e6
 
     def write_reg(self, addr, data):
         """Write to a CDCI6214 Register over I2C
@@ -319,7 +322,7 @@ class CDCI6214:
 
         4. The PLL output clock is then divided by a prescale value (we assume 5),
         then by an output division between 1 and 2**14. The resulting output clock
-        must be between 10MHz and 200MHz for the ADC clock.
+        must be below 200MHz for the ADC clock.
 
         To get the best output settings, we'll be calculating the output frequency
         and calculating its percent error. The settings that result in the
@@ -357,15 +360,18 @@ class CDCI6214:
 
         if old_mul != adc_mul:
             self._adc_mul = adc_mul
-            scope_logger.warning("ADC frequency must be between 1MHz and {}MHz - ADC mul has been adjusted to {}".format(self._max_freq, adc_mul))
+            if not adc_off:
+                scope_logger.warning("ADC frequency must be between 1MHz and {}MHz - ADC mul has been adjusted to {}".format(self._max_freq, adc_mul))
 
-        if adc_mul * target_freq > 200E6:
+        if adc_mul * target_freq > self._warning_freq:
             scope_logger.warning("""
                 ADC frequency exceeds specification (200 MHz). 
                 This may or may not work, depending on temperature, voltage, and luck.
                 It may not work reliably.
                 You can run scope.adc_test() to check whether ADC data is sampled properly by the FPGA,
                 but this doesn't fully verify that the ADC is working properly.
+                You can adjust scope.clock.pll._warning_freq if you don't want
+                to see this message anymore.
                 """)
 
         scope_logger.debug("adc_mul: {}".format(adc_mul))
@@ -575,7 +581,7 @@ class CDCI6214:
     def adc_freq(self):
         """The actual calculated adc_clock freq. Read only
         """
-        if self._cached_adc_freq is None:
+        if True:
             indiv = self.get_input_div()
             outdiv = self.get_outdiv(3)
             if not indiv:
@@ -727,7 +733,11 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
         sampling clock will remain tied to the *previous* external clock
         frequency.
 
-        :Getter: Return the current PLL input (either "system" or "extclk")
+        A variant on "extclk" is "extclk_aux_io", when the external clock is
+        supplied on the AUX I/O MCX instead of the HS1 pin (scope.io.aux_io_mcx
+        must be set to "high_z" in this case).
+
+        :Getter: Return the current PLL input ("system", "extclk" or "extclk_aux_io")
 
         :Setter: Change the CLKGEN source
 
@@ -739,7 +749,13 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
         if self.pll.pll_src == "xtal":
             return "system"
         elif self.pll.pll_src == "fpga":
-            return "extclk"
+            data = self.oa.sendMessage(CODE_READ, ADDR_EXTCLK, maxResp=1)[0]
+            if data & 0x03 == 0x03:
+                return "extclk"
+            elif data & 0x03 == 0x00:
+                return "extclk_aux_io"
+            else:
+                raise ValueError("Unexpected value: %d" % data)
 
         raise ValueError("Invalid FPGA/PLL settings!") #TODO: print values
 
@@ -752,7 +768,16 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
             self.pll.pll_src = "xtal"
             self.fpga_clk_settings.enabled = False # keep things cool
             self.clkgen_freq = clkgen_freq
-        elif clk_src == "extclk":
+        elif clk_src in ["extclk", 'extclk_aux_io']:
+            data = self.oa.sendMessage(CODE_READ, ADDR_EXTCLK, maxResp=1)[0]
+            if clk_src == 'extclk':
+                #set bits [2:0] to 011:
+                data &= 0xf8
+                data |= 0x03
+            else:
+                #set bits [2:0] to 000:
+                data &= 0xf8
+            self.oa.sendMessage(CODE_WRITE, ADDR_EXTCLK, [data])
             self.pll.pll_src = "fpga"
             self.fpga_clk_settings.adc_src = "extclk_dir"
             self.fpga_clk_settings.enabled = False # keep things cool
@@ -760,7 +785,7 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
             self.clkgen_freq = self.fpga_clk_settings.freq_ctr
             self.extclk_monitor_enabled = True
         else:
-            raise ValueError("Invalid src settings! Must be 'internal', 'system' or 'extclk', not {}".format(clk_src))
+            raise ValueError("Invalid src settings! Must be 'internal', 'system', 'extclk' or 'extclk_aux_io', not {}".format(clk_src))
 
     @property
     def clkgen_freq(self):
@@ -774,13 +799,13 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
 
         * The minimum output frequency is 500kHz and the maximum is 350MHz
         * The ADC clock output frequency (clkgen_freq * adc_mul) must be
-        between 10MHz and 200MHz. Therefore, if you want to use
-        a clkgen_freq above 200MHz, you must set adc_mul=0
+            below 200MHz. Therefore, if you want to use
+            a clkgen_freq above 200MHz, you must set adc_mul=0
         * The accuracy of the actual clkgen_freq will depend
-        on adc_mul, as the output divisor for the clkgen_freq must divide
-        cleanly by adc_mul. For example, if you try to use a clkgen_freq
-        of 7.37MHz and and adc_mul of 16, the closest valid clkgen_freq
-        will be 7.5MHz.
+            on adc_mul, as the output divisor for the clkgen_freq must divide
+            cleanly by adc_mul. For example, if you try to use a clkgen_freq
+            of 7.37MHz and and adc_mul of 16, the closest valid clkgen_freq
+            will be 7.5MHz.
 
         :Getter: Return the calculated target clock frequency in Hz
 
@@ -846,6 +871,27 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
         return self.fpga_clk_settings.freq_ctr
 
     @property
+    def freq_ctr_src(self):
+        """The current input to the frequency counter.
+
+        There are two possible inputs to the frequency counter:
+        - "clkgen": The CLKGEN DCM output
+        - "extclk": The external input clock signal
+
+        :Getter: Return the frequency counter input (one of the above strings)
+
+        :Setter: Set the frequency counter source
+
+        Raises:
+           ValueError: if source is not "pll" or "extclk"
+        """
+        return self.fpga_clk_settings.freq_ctr_src
+
+    @freq_ctr_src.setter
+    def freq_ctr_src(self, src):
+        self.fpga_clk_settings.freq_ctr_src = src
+
+    @property
     def clkgen_locked(self):
         """Checks if the Husky PLL is locked"""
         return self.pll.pll_locked
@@ -894,8 +940,9 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
 
         When using an external clock to drive ChipWhisperer (i.e.
         self.clkgen_src == 'extclk'), Husky must know the frequency of that
-        clock. This clock monitor is a convenience to flag when the frequency
-        changes without Husky being informed of that change.
+        clock (by setting scope.clock.clkgen_freq). This clock monitor is a
+        convenience to flag when the frequency changes without Husky being
+        informed of that change.
 
         :Getter: Whether the external clock monitor is enabled.
 
@@ -917,8 +964,12 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
 
     @property
     def extclk_error(self):
-        """TODO
-        :Getter: Whether the external clock monitor is enabled.
+        """When the external clock is used, a change in clock frequency
+        exceeding extclk_error will flag an error. The purpose of this is to
+        remind you that you need to set scope.clock.clkgen_freq to the
+        frequency of your external clock.
+
+        :Getter: Whether the external clock monitor has flagged an error.
 
         :Setter: Clear the error.
         """
@@ -963,6 +1014,7 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
         my_dict['adc_mul'] = self.adc_mul
         my_dict['adc_freq'] = self.adc_freq
         my_dict['freq_ctr'] = self.freq_ctr
+        my_dict['freq_ctr_src'] = self.freq_ctr_src
         my_dict['clkgen_locked'] = self.clkgen_locked
         my_dict['adc_phase'] = self.adc_phase
         my_dict['extclk_monitor_enabled'] = self.extclk_monitor_enabled
@@ -978,11 +1030,6 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
 
     @property
     def adc_src(self):
-        return "For Husky, please use scope.clock.clkgen_src and scope.clock.adc_mul instead."
-
-
-    @adc_src.setter
-    def adc_src(self, src):
         """Convenience function for backwards compatibility with how ADC clocks
         are set on CW-lite and CW-pro.
 
@@ -1001,6 +1048,11 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
         Raises:
            ValueError: if string not in valid settings
         """
+        return "For Husky, please use scope.clock.clkgen_src and scope.clock.adc_mul instead."
+
+
+    @adc_src.setter
+    def adc_src(self, src):
         scope_logger.warning("scope.clock.adc_src is provided for backwards compability, but scope.clock.clkgen_src and scope.clock.adc_mul should be used for Husky.")
 
         if src == "clkgen_x4":
@@ -1033,3 +1085,43 @@ class ChipWhispererHuskyClock(util.DisableNewAttr):
         are managed on CW-lite and CW-pro.
         """
         return self.pll.pll_locked
+
+    @property
+    def fpga_vco_freq(self):
+        """Set the FPGA clock glitch PLL's VCO frequency.
+
+        Affects :attr:`scope.glitch.phase_shift_steps <chipwhisperer.capture.scopes.cwhardware.ChipWhispererGlitch.GlitchSettings.phase_shift_steps>`
+
+        Allowed range: 600 - 1200 MHz.
+
+        :getter: Calculate vco from last set value [Hz]
+
+        :setter: Set the vco frequency [Hz]
+
+        Raises:
+            ValueError: set vco out of valid range
+        """
+        muldiv = self.pll._mmcm_muldiv
+        vco = self.pll.target_freq * muldiv
+        return vco
+
+    @fpga_vco_freq.setter
+    def fpga_vco_freq(self, vco):
+        """Set the FPGA clock glitch PLL's VCO frequency.
+
+        Affects scope.glitch.phase_shift_steps
+
+        Allowed range: 600 - 1200 MHz.
+
+        :getter: Calculate vco from last set value [Hz]
+
+        :setter: Set the vco frequency [Hz]
+
+        Raises:
+            ValueError: set vco out of valid range
+        """
+        vco = int(vco)
+        if (vco > 600e3) or (vco < 1200e3):
+            raise ValueError("Invalid VCO frequency {} (allowed range 600MHz-1200MHz".format(vco))
+
+        self.pll.update_fpga_vco(vco)

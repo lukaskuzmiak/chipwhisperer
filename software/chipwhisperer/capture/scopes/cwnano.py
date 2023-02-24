@@ -18,6 +18,7 @@ from ...capture.scopes.openadc_interface.naeusbchip import OpenADCInterface_NAEU
 from ...common.utils import util
 from ...common.utils.util import dict_to_str
 from collections import OrderedDict
+from ...hardware.naeusb.serial import USART
 from .cwhardware.ChipWhispererSAM3Update import SAMFWLoader
 
 from ...hardware.naeusb.serial import USART
@@ -47,7 +48,7 @@ class ADCSettings(util.DisableNewAttr):
         rtn['clk_src'] = self.clk_src
         rtn['clk_freq'] = self.clk_freq
         rtn['samples'] = self.samples
-        return dict
+        return rtn
 
     def __repr__(self):
         return util.dict_to_str(self._dict_repr())
@@ -165,7 +166,7 @@ class GlitchSettings(util.DisableNewAttr):
         rtn = OrderedDict()
         rtn['repeat'] = self.repeat
         rtn['ext_offset'] = self.ext_offset
-        return dict
+        return rtn
 
     def __repr__(self):
         return util.dict_to_str(self._dict_repr())
@@ -527,16 +528,18 @@ class CWNano(util.DisableNewAttr, ChipWhispererCommonInterface):
     For more help about scope settings, try help() on each of the ChipWhisperer
     scope submodules (scope.adc, scope.io, scope.glitch):
 
-      * :attr:`scope.adc <.CWNano.adc>`
-      * :attr:`scope.io <.CWNano.io>`
-      * :attr:`scope.glitch <.CWNano.glitch>`
+      * :attr:`scope.adc <chipwhisperer.capture.scopes.cwnano.ADCSettings>`
+      * :attr:`scope.io <chipwhisperer.capture.scopes.cwnano.GPIOSettings>`
+      * :attr:`scope.glitch <chipwhisperer.capture.scopes.cwnano.GlitchSettings>`
       * :meth:`scope.default_setup <.CWNano.default_setup>`
       * :meth:`scope.con <.CWNano.con>`
       * :meth:`scope.dis <.CWNano.dis>`
       * :meth:`scope.get_last_trace <.CWNano.get_last_trace>`
       * :meth:`scope.arm <.CWNano.arm>`
       * :meth:`scope.capture <.CWNano.capture>`
-      * :meth:`scope.get_serial_ports <.CWNano.get_serial_ports>`
+      * :meth:`scope.get_serial_ports <chipwhisperer.capture.api.cwcommon.ChipWhispererCommonInterface.get_serial_ports>`
+
+    Inherits from :class:`chipwhisperer.capture.api.cwcommon.ChipWhispererCommonInterface`
     """
 
     _name = "ChipWhisperer Nano"
@@ -593,14 +596,45 @@ class CWNano(util.DisableNewAttr, ChipWhispererCommonInterface):
         self.io.tio2 = "serial_tx"
         self.glitch.repeat = 0
 
+    def glitch_disable(self):
+        self.glitch.repeat = 0
+        self.glitch.ext_offset = 0
+
+    def vglitch_setup(self, glitcht=None, default_setup=True):
+        """Sets up sane defaults for voltage glitch
+
+        repeat = 1
+        ext_offset = 0
+        """
+        if default_setup:
+            self.default_setup()
+
+        self.glitch.repeat = 1
+        self.glitch.ext_offset = 0
+
     def getCurrentScope(self):
         return self
+
+    def _get_usart(self) -> USART:
+        return self.usart
 
     def _getNAEUSB(self):
         return self._cwusb
 
     def _getCWType(self):
         return 'cwnano'
+
+    def reset_clock_phase(self):
+        """Resets the target and adc clocks, resetting their phase
+
+        .. warning:: causes an interruption in the target clock. You may need to reset the target.
+        """
+        if self.check_feature("NANO_CLOCK_RESET"):
+            tfreq = self.io.clkout
+            afreq = self.adc.clk_freq
+            self._getNAEUSB().sendCtrl(0x22, 0xF0)
+            self.io.clkout = tfreq
+            self.adc.clk_freq = afreq
 
     def con(self, sn=None, **kwargs):
         """Connects to attached chipwhisperer hardware (Nano)
@@ -744,3 +778,9 @@ is in an error state, or is being used by another tool.") from e
 
     def usbdev(self):
         return self._cwusb
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.dis()

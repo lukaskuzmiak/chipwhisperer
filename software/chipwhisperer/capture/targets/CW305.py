@@ -34,7 +34,7 @@ from ...hardware.naeusb.naeusb import NAEUSB,packuint32
 from ...hardware.naeusb.pll_cdce906 import PLLCDCE906
 from ...hardware.naeusb.fpga import FPGA
 from ...common.utils import util
-from ...common.utils.util import camel_case_deprecated, fw_ver_required
+from ...common.utils.util import camel_case_deprecated
 from ..scopes.cwhardware.ChipWhispererSAM3Update import SAMFWLoader
 from ..api.cwcommon import ChipWhispererCommonInterface
 
@@ -148,8 +148,10 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
     def slurp_defines(self, defines_files=None):
         """ Parse Verilog defines file so we can access register and bit
         definitions by name and avoid 'magic numbers'.
+
         Args:
             defines_files (list): list of Verilog define files to parse
+
         """
         self.verilog_define_matches = 0
 
@@ -279,7 +281,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         resp = self._naeusb.readCtrl(CW305_USB.REQ_VCCINT, dlen=3)
         return float(resp[1] | (resp[2] << 8)) / 1000.0
 
-    def _con(self, scope=None, bsfile=None, force=False, fpga_id=None, defines_files=None, slurp=True, prog_speed=10E6):
+    def _con(self, scope=None, bsfile=None, force=False, fpga_id=None, defines_files=None, slurp=True, prog_speed=20E6, hw_location=None, sn=None):
         """Connect to CW305 board, and download bitstream.
 
         If the target has already been programmed it skips reprogramming
@@ -294,7 +296,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
             defines_files (list, optional): path to cw305_defines.v
             slurp (bool, optional): Whether or not to slurp the Verilog defines.
         """
-        self._naeusb.con(idProduct=[0xC305])
+        self._naeusb.con(idProduct=[0xC305], serial_number=sn, hw_location=hw_location)
         if not fpga_id is None:
             if fpga_id not in ('100t', '35t'):
                 raise ValueError(f"Invalid fpga {fpga_id}")
@@ -500,7 +502,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         else:
             raise ValueError("Unknown command {}".format(cmd))
 
-    def set_key(self, key, ack=False, timeout=250):
+    def set_key(self, key, ack=False, timeout=250, always_send=False):
         """Checks if key is different from the last one sent. If so, send it.
 
         Args:
@@ -511,7 +513,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         .. versionadded:: 5.1
             Added set_key to CW305
         """
-        if self.last_key != key:
+        if (self.last_key != key) or always_send:
             self.last_key = key
             self.simpleserial_write('k', key)
 

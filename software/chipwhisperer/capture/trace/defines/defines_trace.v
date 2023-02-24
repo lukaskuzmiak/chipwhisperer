@@ -61,6 +61,7 @@
 `define REG_SWO_BITRATE_DIV     6'h21
 `define REG_UART_STOP_BITS      6'h22
 `define REG_UART_DATA_BITS      6'h23
+`define REG_UART_PARITY_SETTING 6'h24
 
 `define REG_FE_CLOCK_SEL        6'h25
 `define REG_STAT                6'h26
@@ -76,6 +77,15 @@
 `define REG_TRACE_USERIO_DIR    6'h2e
 
 `define REG_BUFFER              6'h2f
+`define REG_UART                6'h30
+
+`define REG_TRACECLK_PHASE      6'h31
+`define REG_TRACECLK_DRP_ADDR   6'h32
+`define REG_TRACECLK_DRP_DATA   6'h33
+`define REG_TRACECLK_DRP_RESET  6'h34
+`define REG_TRACECLK_SHIFT_EN   6'h35
+
+`define REG_TRACE_TEST          6'h36
 
 // FIFO bitfields:
 //                   31 30 29 28 27 26 25 24   23 22 21 20 19 18 17 16   15 14 13 12 11 10  9  8   7  6  5  4  3  2  1  0

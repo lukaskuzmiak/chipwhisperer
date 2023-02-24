@@ -68,6 +68,8 @@ ADDR_SEGMENT_CYCLE_COUNTER_EN = 92
 ADDR_MAX_SAMPLES = 93
 ADDR_MAX_SEGMENT_SAMPLES = 94
 
+ADDR_FIFO_STATE = 110
+
 
 CODE_READ       = 0x80
 CODE_WRITE      = 0xC0
@@ -435,17 +437,39 @@ class OpenADCInterface(util.DisableNewAttr):
     def set_clip_errors_disabled(self, disable):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
+        raw = self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0]
         if disable:
-            val = [1]
+            raw |= 1 # set bit 0
         else:
-            val = [0]
-        self.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, val)
+            raw &= 2 # clear bit 0
+        self.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [raw])
 
 
     def clip_errors_disabled(self):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        return self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0]
+        if self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0] & 1:
+            return True
+        else:
+            return False
+
+    def set_lo_gain_errors_disabled(self, disable):
+        if not self._is_husky:
+            raise ValueError("For CW-Husky only.")
+        raw = self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0]
+        if disable:
+            raw |= 2 # set bit 1
+        else:
+            raw &= 1 # clear bit 1
+        self.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [raw])
+
+    def lo_gain_errors_disabled(self):
+        if not self._is_husky:
+            raise ValueError("For CW-Husky only.")
+        if self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0] & 2:
+            return True
+        else:
+            return False
 
 
     def numSamples(self):
@@ -781,6 +805,9 @@ class OpenADCInterface(util.DisableNewAttr):
             if len(datapoints) > NumberPoints:
                 datapoints = datapoints[0:NumberPoints]
 
+            if len(self._int_data) > NumberPoints:
+                self._int_data = self._int_data[0:NumberPoints]
+
             # if len(datapoints) < NumberPoints:
             # print len(datapoints),
             # print NumberPoints
@@ -908,6 +935,7 @@ class OpenADCInterface(util.DisableNewAttr):
             self._int_data = np.array(fpData, dtype='int16')
             fpData = fpData / 1024.0 - self.offset
             scope_logger.debug("Trigger_data: {} len={}".format(trigger, len(trigger)))
+            scope_logger.debug("Unprocessed data, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
 
             # Search for the trigger signal
             trigfound = False
@@ -935,12 +963,16 @@ class OpenADCInterface(util.DisableNewAttr):
         if diff > 0:
             #fpData = [pad]*diff + fpData
             fpData = np.append([pad]*diff, fpData)
+            self._int_data = np.append([0x00]*diff, self._int_data)
+            scope_logger.debug("Diff > 0, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
             scope_logger.warning('Pretrigger not met: Do not use downsampling and pretriggering at same time.')
             scope_logger.debug('Pretrigger not met: can attempt to increase presampleTempMargin(in the code).')
         else:
+            scope_logger.debug("Diff <= 0, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
             fpData = fpData[-diff:]
+            self._int_data = self._int_data[-diff:]
 
-        scope_logger.debug("Processed data, ended up with %d samples total"%len(fpData))
+        scope_logger.debug("Processed data, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
 
         return fpData
 
@@ -1073,7 +1105,7 @@ class GainSettings(util.DisableNewAttr):
         return self.__repr__()
 
     @property
-    def db(self):
+    def db(self) -> float:
         """The gain of the ChipWhisperer's low-noise amplifier in dB. Ranges
         from -6.5 dB to 56 dB, depending on the amplifier settings.
 
@@ -1104,6 +1136,7 @@ class GainSettings(util.DisableNewAttr):
         This setting is applied after the gain property, resulting in the value
         of the db property. May be necessary for reaching gains higher than
 
+        :meta private:
 
         Args:
            gainmode (str): Either 'low' or 'high'.
@@ -1144,7 +1177,7 @@ class GainSettings(util.DisableNewAttr):
             return "low"
 
     @property
-    def mode(self):
+    def mode(self) -> str:
         """The current mode of the LNA.
 
         The LNA can operate in two modes: low-gain or high-gain. Generally, the
@@ -1165,7 +1198,11 @@ class GainSettings(util.DisableNewAttr):
         return self.setMode(val)
 
     def setGain(self, gain):
-        '''Set the Gain range: 0-78 for CW-Lite and CW-Pro; 0-109 for CW-Husky'''
+        '''Set the Gain range: 0-78 for CW-Lite and CW-Pro; 0-109 for CW-Husky
+
+        :meta private:
+
+        '''
         if self._is_husky:
             maxgain = 109
         else:
@@ -1271,6 +1308,8 @@ class GainSettings(util.DisableNewAttr):
 
     def auto_gain(self, margin=20):
         '''Increment gain until clipping occurs, then reduce by <margin> dB (default: 20 dB)
+
+        :meta private:
         '''
         if not self._is_husky:
             raise ValueError("Only supported on Husky")
@@ -1352,6 +1391,7 @@ class TriggerSettings(util.DisableNewAttr):
             rtn['segment_cycles'] = self.segment_cycles
             rtn['segment_cycle_counter_en'] = self.segment_cycle_counter_en
             rtn['clip_errors_disabled'] = self.clip_errors_disabled
+            rtn['lo_gain_errors_disabled'] = self.lo_gain_errors_disabled
             rtn['errors'] = self.errors
             # keep these hidden:
             #rtn['stream_segment_size'] = self.stream_segment_size
@@ -1410,6 +1450,8 @@ class TriggerSettings(util.DisableNewAttr):
         conditions it may be possible to obtain higher streaming performance by
         tweaking these parameters -- this depends on the sampling rate and
         capture size. But it's also easy to degrade performance.  
+
+        :meta private:
         """ 
         return self._get_stream_segment_threshold()
 
@@ -1432,6 +1474,9 @@ class TriggerSettings(util.DisableNewAttr):
         conditions it may be possible to obtain higher streaming performance by
         tweaking these parameters -- this depends on the sampling rate and
         capture size. But it's also easy to degrade performance.  
+
+        :meta private:
+
         """
         return self._get_stream_segment_size()
 
@@ -1472,14 +1517,26 @@ class TriggerSettings(util.DisableNewAttr):
     @property
     def clip_errors_disabled(self):
         """By default, ADC clipping is flagged as an error. Disable if you
-        do not want this notification (for example, when using the test ramp).
+        do not want this error notification.
         """
-        return self._get_clip_errors_disabled()
+        return self.oa.clip_errors_disabled()
 
     @clip_errors_disabled.setter
     def clip_errors_disabled(self, disable):
-        self.clear_clip_errors()
-        self._set_clip_errors_disabled(disable)
+        self.oa.set_clip_errors_disabled(disable)
+
+    @property
+    def lo_gain_errors_disabled(self):
+        """By default, captures which use less than a quarter of the ADC's
+        dynamic range flag an error, to indicate that the gain should be
+        increased. Disable if you do not want this error notification.
+        """
+        return self.oa.lo_gain_errors_disabled()
+
+    @lo_gain_errors_disabled.setter
+    def lo_gain_errors_disabled(self, disable):
+        self.oa.set_lo_gain_errors_disabled(disable)
+
 
 
     @property
@@ -1518,6 +1575,29 @@ class TriggerSettings(util.DisableNewAttr):
 
         self._cached_samples = samples
         self._set_num_samples(samples)
+
+    @property
+    def fifo_state(self):
+        """Husky only, for debugging: return the state of the Husky FIFO FSM.
+        """
+        if not self._is_husky:
+            raise ValueError("For CW-Husky only.")
+        state = self.oa.sendMessage(CODE_READ, ADDR_FIFO_STATE, maxResp=1)[0]
+        if state == 0:
+            return 'IDLE'
+        elif state == 1:
+            return 'PRESAMP_FILLING'
+        elif state == 2:
+            return 'PRESAMP_FULL'
+        elif state == 3:
+            return 'TRIGGERED'
+        elif state == 4:
+            return 'SEGMENT_DONE'
+        elif state == 5:
+            return 'DONE'
+        else:
+            raise ValueError("Unexpected value: %d" % state)
+
 
     @property
     def timeout(self):
@@ -1735,26 +1815,27 @@ class TriggerSettings(util.DisableNewAttr):
         """Number of sample segments to capture.
 
         .. warning:: Supported by CW-Husky only. For segmenting on CW-lite or
-        CW-pro, see 'fifo_fill_mode' instead.
+            CW-pro, see 'fifo_fill_mode' instead.
 
         This setting must be a 16-bit positive integer. 
 
         In normal operation, segments=1. 
 
         Multiple segments are useful in two scenarios:
-        (1) Capturing only subsections of a power trace, to allow longer
+
+        #. Capturing only subsections of a power trace, to allow longer
             effective captures.  After a trigger event, the requested number of
             samples is captured every 'segment_cycles' clock cycles, 'segments'
             times. Set 'segment_cycle_counter_en' to 1 for this segment mode.
-        (2) Speeding up capture times by capturing 'segments' power traces from
+        #. Speeding up capture times by capturing 'segments' power traces from
             a single arm + capture event. Here, the requested number of samples
             is captured at every trigger event, without having to re-arm and
             download trace data between every trigger event. Set
             'segment_cycle_counter_en' to 0 for this segment mode.
 
         .. warning:: when capturing multiple segments with presamples, the total number of samples 
-        per segment must be a multiple of 3. Incorrect sample data will be obtained if this is not 
-        the case.
+            per segment must be a multiple of 3. Incorrect sample data will be obtained if this is not 
+            the case.
 
         :Getter: Return the current number of presamples
 
@@ -1793,7 +1874,41 @@ class TriggerSettings(util.DisableNewAttr):
     @property
     def errors(self):
         """Internal error flags (FPGA FIFO over/underflow)
+
         .. warning:: Supported by CW-Husky only.
+
+        Error types and their causes:
+            * 'presample error': capture trigger occurs before the requested
+                    number of presamples have been collected. Reduce 
+                    scope.adc.presamples or delay the capture trigger.
+            * 'ADC clipped': gain is too high; reduce it (scope.gain) or disable 
+                    this error (scope.adc.clip_errors_disabled).
+            * 'gain too low error': gain is "too low" (4 bits or more of the ADC's
+                    dynamic range did not get used); increase it (scope.gain) or 
+                    disable this error (scope.adc.lo_gain_errors_disabled).
+            * 'invalid downsample setting': using downsampling (aka decimating) with
+                    presamples and multiple segments is not allowed.
+            * 'segmenting error': the condition for starting the capture of the next
+                    segment came true before the capture of the current segment
+                    completed. Reduce the segment size and/or increase the time
+                    between segments.
+            * 'fast FIFO underflow': shouldn't occur in isolation without
+                    other errors being flagged.
+            * 'fast FIFO overflow': data is coming in fast than it's being read;
+                    reduce scope.clock.adc_freq.
+            * 'slow FIFO underflow': host tried to read more ADC samples than are
+                    available.
+            * 'slow FIFO overflow': data is coming in faster than it's being
+                    read; reduce scope.clock.adc_freq.
+
+        To fully understand the four different FIFO errors (fast/slow
+        over/underflows), some background on Husky's sample storage
+        architecture is required.  ADC samples are first stored in a "fast"
+        FIFO which runs at the ADC sampling rate, then moved to a wider and
+        "slower" FIFO which is read by the host. Overflows or underflows can
+        occur in either FIFO. Errors can be caused from an illegal
+        configuration of scope.adc (e.g. too many samples), or attempting to
+        stream too fast.
 
         :Getter: Return the error flags.
 
@@ -1805,16 +1920,18 @@ class TriggerSettings(util.DisableNewAttr):
     @errors.setter
     def errors(self, val):
         """Internal error flags (FPGA FIFO over/underflow)
+
         .. warning:: Supported by CW-Husky only.
+
         """
         self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [1])
-        if not self.clip_errors_disabled:
-            self.clear_clip_errors()
+        self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [0])
 
 
     @property
     def first_error(self):
         """Reports the first error that was flagged (self.errors reports *all* errors). Useful for debugging. Read-only.
+
         .. warning:: Supported by CW-Husky only.
 
         :Getter: Return the error flags.
@@ -1828,6 +1945,7 @@ class TriggerSettings(util.DisableNewAttr):
     @property
     def first_error_state(self):
         """Reports the state the FPGA FSM state at the time of the first flagged error. Useful for debugging. Read-only.
+
         .. warning:: Supported by CW-Husky only.
 
         :Getter: Return the error flags.
@@ -1849,16 +1967,17 @@ class TriggerSettings(util.DisableNewAttr):
     def _get_errors(self, addr):
         if self.oa is None:
             return 0
-        raw = self.oa.sendMessage(CODE_READ, addr, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, addr, maxResp=2)
         stat = ''
-        if raw & 1:   stat += 'slow FIFO underflow, '
-        if raw & 2:   stat += 'slow FIFO overflow, '
-        if raw & 4:   stat += 'fast FIFO underflow, '
-        if raw & 8:   stat += 'fast FIFO overflow, '
-        if raw & 16:  stat += 'presample error, '
-        if raw & 32:  stat += 'ADC clipped, '
-        if raw & 64:  stat += 'invalid downsample setting, '
-        if raw & 128: stat += 'segmenting error, '
+        if raw[0] & 1:   stat += 'slow FIFO underflow, '
+        if raw[0] & 2:   stat += 'slow FIFO overflow, '
+        if raw[0] & 4:   stat += 'fast FIFO underflow, '
+        if raw[0] & 8:   stat += 'fast FIFO overflow, '
+        if raw[0] & 16:  stat += 'presample error, '
+        if raw[0] & 32:  stat += 'ADC clipped, '
+        if raw[0] & 64:  stat += 'invalid downsample setting, '
+        if raw[0] & 128: stat += 'segmenting error, '
+        if raw[1] & 1:   stat += 'gain too low error, '
         if stat == '':
             stat = False
         return stat
@@ -1869,7 +1988,7 @@ class TriggerSettings(util.DisableNewAttr):
         """Number of clock cycles separating segments.
 
         .. warning:: Supported by CW-Husky only. For segmenting on CW-lite or
-        CW-pro, see 'fifo_fill_mode' instead.
+            CW-pro, see 'fifo_fill_mode' instead.
 
         This setting must be a 20-bit positive integer. 
 
@@ -1878,12 +1997,19 @@ class TriggerSettings(util.DisableNewAttr):
         following the initial trigger event. 'segment_cycle_counter_en' must
         also be set.
 
+        Typically, segment_cycles should be much greater than
+        scope.adc.samples. If they are too close, capture will fail (indicated by
+        the blinking red lights and scope.adc.errors showing either a
+        segmenting error or a FIFO over/underflow error). 
+        When presamples = 0, segment_cycles >= samples + 10.
+        When presamples > 0, segment_cycles >= samples + presamples AND segment_cycles >= samples + 10.
+
         :Getter: Return the current value of segment_cycles.
 
         :Setter: Set segment_cycles.
 
         Raises:
-           ValueError: if segments is outside of range [0, 2^16-1]
+           ValueError: if segments is outside of range [0, 2^20-1]
         """
 
         if self._cached_segment_cycles is None:
@@ -1918,7 +2044,7 @@ class TriggerSettings(util.DisableNewAttr):
         """Number of clock cycles separating segments.
 
         .. warning:: Supported by CW-Husky only. For segmenting on CW-lite or
-        CW-pro, see 'fifo_fill_mode' instead.
+            CW-pro, see 'fifo_fill_mode' instead.
 
         Set to 0 to capture a new power trace segment every time the target
         issues a trigger event.
@@ -1929,7 +2055,6 @@ class TriggerSettings(util.DisableNewAttr):
         :Getter: Return the current value of segment_cycle_counter_en.
 
         :Setter: Set segment_cycles.
-
         """
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
@@ -2016,6 +2141,9 @@ class TriggerSettings(util.DisableNewAttr):
         :Getter: Return True if test mode is enabled and False otherwise
 
         :Setter: Enable or disable test mode
+
+        :meta private:
+
         """
         return self._get_test_mode()
 
@@ -2076,21 +2204,11 @@ class TriggerSettings(util.DisableNewAttr):
     def _get_decimate(self):
         return self.oa.decimate()
 
-    def _set_clip_errors_disabled(self, disable):
-        self.oa.set_clip_errors_disabled(disable)
-
     def clear_clip_errors(self):
         """ADC clipping errors are sticky until manually cleared by calling this.
         """
         self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [1])
-        self._set_clip_errors_disabled(True)
-        self._set_clip_errors_disabled(False)
-        self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [1])
-
-
-    def _get_clip_errors_disabled(self):
-        return self.oa.clip_errors_disabled()
-
+        self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [0])
 
     def _set_num_samples(self, samples):
         if samples < 0 or not type(samples) is int:
@@ -2322,11 +2440,10 @@ class ClockSettings(util.DisableNewAttr):
 
     @property
     def enabled(self):
-        """Controls whether the Xilinx MMCMs used to generate glitches are
-        powered on or not.  7-series MMCMs are power hungry. In the Husky FPGA,
-        MMCMs are estimated to consume close to half of the FPGA's power. If
-        you run into temperature issues and don't require glitching, you can
-        power down these MMCMs.
+        """Controls whether the Xilinx MMCM used to generate the target clock
+        is powered on or not. In Husky, an external PLL is used instead; this
+        FPGA PLL is still present but disabled by default because MMCMs are
+        quite power-hungry.
 
         """
         if not self._is_husky:
@@ -2419,7 +2536,7 @@ class ClockSettings(util.DisableNewAttr):
         This clock frequency is derived from one of the ADC clock sources as
         described in adc_src.
 
-        :Getter: Return the current frequency in MHz (float). May take
+        :Getter: Return the current frequency in Hz (int). May take
                 up to 0.5s to stabilize after adc_locked is True.
         """
         return self._getAdcFrequency()
@@ -2431,7 +2548,7 @@ class ClockSettings(util.DisableNewAttr):
         Note that the sampling rate may be less than the clock frequency if
         the downsampling factor is greater than 1.
 
-        :Getter: Return the current sampling rate in MS/s (float)
+        :Getter: Return the current sampling rate in samples/s (float)
         """
         return self._adcSampleRate()
 
@@ -2447,13 +2564,13 @@ class ClockSettings(util.DisableNewAttr):
 
     @property
     def freq_ctr(self):
-        """The current frequency at the frequency counter in MHz. Read-only.
+        """The current frequency at the frequency counter in Hz. Read-only.
 
         The frequency counter can be used to check the speed of the CLKGEN
         output or the EXTCLK input. This value shows the current frequency
         reading.
 
-        :Getter: Return the current frequency in MHz (float)
+        :Getter: Return the current frequency in Hz (int)
         """
         return self._get_extfrequency()
 
@@ -3044,7 +3161,7 @@ class ClockSettings(util.DisableNewAttr):
 
         return (dcmADCLocked, dcmCLKGENLocked)
 
-    def _reset_dcms(self, resetAdc=True, resetClkgen=True):
+    def _reset_dcms(self, resetAdc=True, resetClkgen=True, resetGlitch=True):
         result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
 
         #Set reset high on requested blocks only
@@ -3066,6 +3183,14 @@ class ClockSettings(util.DisableNewAttr):
         #Load clkgen if required
         if resetClkgen:
             self._clkgenLoad()
+
+        if resetGlitch:
+            glitchaddr = 51
+            reset = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+            reset[5] |= (1<<1)
+            self.oa.sendMessage(CODE_WRITE, glitchaddr, reset, Validate=False)
+            reset[5] &= ~(1<<1)
+            self.oa.sendMessage(CODE_WRITE, glitchaddr, reset, Validate=False)
 
     def _get_extfrequency(self):
         """Return frequency of clock measured on EXTCLOCK pin in Hz"""

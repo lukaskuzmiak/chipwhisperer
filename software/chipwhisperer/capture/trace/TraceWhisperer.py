@@ -25,6 +25,7 @@
 #    along with chipwhisperer.  If not, see <http://www.gnu.org/licenses/>.
 #=================================================
 import time
+import datetime
 import re
 import math
 import pkg_resources # type: ignore
@@ -50,24 +51,30 @@ class TraceWhisperer(util.DisableNewAttr):
     """ Trace interface object.
 
     This class contains the public API for the Arm Coresight trace sniffing
-    hardware, which may exist on either the CW305 or the CW610 (PhyWhisperer)
-    platform.
+    hardware, which exists on several platforms:
+    - CW-Husky
+    - CW305, as DesignStartTrace
+    - CW610 (PhyWhisperer)
 
-    To connect, the easiest method is::
+    Connecting depends on the platform:
 
-        (a) CW305 (DesignStart) case:
-        import chipwhisperer as cw
-        from chipwhisperer.capture.trace.TraceWhisperer import TraceWhisperer
-        scope = cw.scope()
-        target = cw.target(scope, targets.CW305, bsfile=<valid FPGA bitstream file>)
-        trace = TraceWhisperer(target, scope)
+        (a) CW-Husky case: available as scope.trace, no additional steps needed.
 
-        (b) CW610 (PhyWhisperer) case:
-        import chipwhisperer as cw
-        from chipwhisperer.capture.trace.TraceWhisperer import TraceWhisperer
-        scope = cw.scope()
-        target = cw.target(scope)
-        trace = TraceWhisperer(target)
+        (b) CW305 (DesignStart) case::
+        
+            import chipwhisperer as cw
+            from chipwhisperer.capture.trace.TraceWhisperer import TraceWhisperer
+            scope = cw.scope()
+            target = cw.target(scope, targets.CW305, bsfile=<valid FPGA bitstream file>)
+            trace = TraceWhisperer(target, scope)
+
+        (c) CW610 (PhyWhisperer) case::
+        
+            import chipwhisperer as cw
+            from chipwhisperer.capture.trace.TraceWhisperer import TraceWhisperer
+            scope = cw.scope()
+            target = cw.target(scope)
+            trace = TraceWhisperer(target)
 
     """
 
@@ -95,7 +102,7 @@ class TraceWhisperer(util.DisableNewAttr):
         self._base_baud = 38400
         self._usb_clock = 96e6
         self._uart_clock = self._usb_clock * 2
-        self.expected_verilog_defines = 119
+        self.expected_verilog_defines = 131
         self.swo_mode = False
         self._scope = scope
 
@@ -143,6 +150,7 @@ class TraceWhisperer(util.DisableNewAttr):
             self.tms_bit = 0
             self.tck_bit = 1
 
+        self.pattern_size = self.fpga_read(self.REG_BUFFER_SIZE, 1)[0] # match pattern size, in bytes
         self.disable_newattr()
         self._set_defaults()
 
@@ -254,7 +262,8 @@ class TraceWhisperer(util.DisableNewAttr):
                             tracewhisperer_logger.warning("Couldn't parse line: %s", define)
             defines.close()
         # make sure everything is cool:
-        assert self.verilog_define_matches == self.expected_verilog_defines, "Trouble parsing Verilog defines file (%s): didn't find the right number of defines; expected %d, got %d" % (defines_file, self.expected_verilog_defines, self.verilog_define_matches)
+        if self.verilog_define_matches != self.expected_verilog_defines:
+            tracewhisperer_logger.warning("Trouble parsing Verilog defines file (%s): didn't find the right number of defines; expected %d, got %d" % (defines_file, self.expected_verilog_defines, self.verilog_define_matches))
 
 
     @property
@@ -288,9 +297,13 @@ class TraceWhisperer(util.DisableNewAttr):
     @enabled.setter 
     def enabled(self, enable):
         # only one of Trace/LA can be enabled at once:
-        if enable:
-            self._scope.LA.enabled = False
+        if enable and self.platform == 'Husky':
+            if self._scope.LA.enabled:
+                scope_logger.warning("Can't enable scope.LA and scope.trace simultaneously; turning off scope.LA.")
+                self._scope.LA.enabled = False
             self._scope.LA.clkgen_enabled = True
+        if not enable:
+            self.capture.use_husky_arm = False
         self.fpga_write(self.REG_TRACE_EN, [enable])
 
 
@@ -337,7 +350,8 @@ class TraceWhisperer(util.DisableNewAttr):
                 tracewhisperer_logger.error('CW305 does not support SWO mode')
             self.swo_mode = True
             self.fpga_write(self.REG_SWO_ENABLE, [1])
-            self.target_registers.TPI_SPPR = '00000002'
+            if self._ss: # don't want to log an error if no target
+                self.target_registers.TPI_SPPR = '00000002'
             if self.platform == 'Husky':
                 assert self._scope.LA.present, 'Cannot use this operation mode without the LA component.'
                 # disable LA, 
@@ -345,7 +359,8 @@ class TraceWhisperer(util.DisableNewAttr):
         elif mode == "parallel":
             self.swo_mode = False
             self.fpga_write(self.REG_SWO_ENABLE, [0])
-            self.target_registers.TPI_SPPR = '00000000'
+            if self._ss: # don't want to log an error if no target
+                self.target_registers.TPI_SPPR = '00000000'
         else:
             raise ValueError('Invalid mode (swo/parallel)')
 
@@ -370,7 +385,8 @@ class TraceWhisperer(util.DisableNewAttr):
             self.swo_mode = True
             self.target_registers.TPI_SPPR = '00000002'
             self.target_registers.TPI_ACPR = acpr
-            self.fpga_write(self.REG_SWO_BITRATE_DIV, [swo_div-1]) # not a typo: hardware requires -1; doing this is easier than fixing the hardware
+            self.fpga_write(self.REG_SWO_BITRATE_DIV, int.to_bytes([swo_div-1], length=2, byteorder='little')) # not a typo: hardware requires -1; doing this is easier than fixing the hardware
+
             self.fpga_write(self.REG_SWO_ENABLE, [1])
             # Next we set the target clock and update CW baud rate accordingly:
             new_target_clock = int(self._uart_clock / (swo_div * (acpr+1)))
@@ -388,13 +404,34 @@ class TraceWhisperer(util.DisableNewAttr):
         Args:
             div (int): number of cycles per SWO bit.
         """
-        return self.fpga_read(self.REG_SWO_BITRATE_DIV, 1)[0] + 1 # not a typo: hardware requires -1; doing this is easier than fixing the hardware
+        return int.from_bytes(self.fpga_read(self.REG_SWO_BITRATE_DIV, 2), byteorder='little') + 1 # not a typo: hardware requires -1; doing this is easier than fixing the hardware
 
     @swo_div.setter
     def swo_div(self, div):
         if div < 1:
             raise ValueError
-        return self.fpga_write(self.REG_SWO_BITRATE_DIV, [div-1]) # not a typo: hardware requires -1; doing this is easier than fixing the hardware
+        return self.fpga_write(self.REG_SWO_BITRATE_DIV, int.to_bytes(div-1, length=2, byteorder='little')) # not a typo: hardware requires -1; doing this is easier than fixing the hardware
+
+    @property
+    def uart_state(self):
+        """ Return the hardware UART state. For debug.
+        """
+        raw = self.fpga_read(self.REG_UART, 1)[0]
+        # state names from uart_core.v:
+        if   raw == 0: state ='ERX_IDLE'
+        elif raw == 1: state ='ERX_START'
+        elif raw == 2: state ='ERX_BITS'
+        elif raw == 3: state ='ERX_STOP'
+        elif raw == 4: state ='ERX_SYN'
+        else:
+            raise ValueError("Got unknown UART state: %d" % raw)
+        return state
+
+    def _uart_reset(self):
+        """ Reset the hardware UART FSM. Shouldn't be needed!
+        """
+        self.fpga_write(self.REG_UART, [1])
+
 
     @property
     def leds(self):
@@ -522,44 +559,106 @@ class TraceWhisperer(util.DisableNewAttr):
 
 
 
-    def simpleserial_write(self, cmd, data, printresult=False):
+    def simpleserial_write(self, cmd, data, printresult=False, wait=0.6):
         """Convenience function to send a simpleserial command to the simpleserial target,
         and optionally fetch and print the result.
         """
-        self._ss.simpleserial_write(cmd, data)
-        if printresult:
-            time.sleep(0.6) # ECC is slow!
-            print(self._ss.read().split('\n')[0])
+        if self._ss is None:
+            tracewhisperer_logger.error("Target must be connected for this to work (e.g. scope.trace.target = target)")
+        else:
+            self._ss.simpleserial_write(cmd, data)
+            if printresult:
+                time.sleep(wait)
+                print(self._ss.read().split('\n')[0])
 
+    def _words2bytes(self, words):
+        """Converts a list of self.data_bits-sized words into a list of bytes, for programming
+        the REG_TRACE_PATTERNx and REG_TRACE_MASKx registers.
+        """
+        word_size = self.data_bits
+        total_bits = self.pattern_size * 8
+        bigword = 0
+        for i,w in enumerate(words):
+            bigword >>= word_size
+            bigword += (w << (total_bits - word_size))
+            #print('Added %s: %s' % (hex(w), hex(bigword)))
+        result = []
+        #while bigword:
+        for _ in range(self.pattern_size):
+            result.append(bigword & 0xff)
+            bigword >>= 8
+        return result
 
-    def set_pattern_match(self, index, pattern, mask=[0xff]*8):
-        """Sets pattern match and mask parameters
+    def set_pattern_match(self, index, pattern, mask=None, enable_rule=True):
+        """Sets pattern match and mask parameters.
 
         Args:
             index: match index [0-7]
-            pattern: list of 8-bit integers, pattern match value
-            mask: list of 8-bit integers, pattern mask value
-
+            pattern: list of 8-bit integers, pattern match value. Maximum size given by self.pattern_size.
+                If fewer than self.pattern_size bytes are given, the list is expanded to self.pattern_size
+                by *prepending* the required number of zeros (see usage notes below for implications of
+                this for short patterns).
+            mask (list, optional): list of bytes, must have same size as 'pattern' if
+                set. Defaults to [0]*(self.pattern_size*8-len(pattern) + [0xff]*len(pattern) if not set.
+                See usage notes below for implications of this for short patterns.
+        Usage notes:
+            The pattern matching logic looks at the full match pattern and mask, including mask bytes which
+            are set to 0. For example, pattern = [1,2,3,4,0,0,0,0], mask = [255,255,255,255,0,0,0,0] will
+            trigger a match when 8 bytes ([1,2,3,4] followed by 4 don't care bytes) have been received 
+            (this example assumes self.pattern_size = 8).  If only [1,2,3,4] is received (no other data 
+            follows), no match will be triggered.
+            If the message you which to trigger on is shorter than self.pattern_size, you must set the don't
+            care bytes at the *start* of the pattern and mask; for example: pattern = [0,0,0,0,1,2,3,4],
+            mask = [0,0,0,0,255,255,255,255] will trigger a match immediately after [1,2,3,4] is received
+            (even if no valid data is received prior to this).
         """
-        self.fpga_write(self.REG_TRACE_PATTERN0+index, pattern)
-        self.fpga_write(self.REG_TRACE_MASK0+index, mask)
+        # Since this also gets used by generic UART, we can't assume that word size is 8 bits.
+        # Translate pattern (and mask, if provided) to bytes:
+        if len(pattern) > self.pattern_size:
+            raise ValueError('pattern and mask cannot be more than 64 bytes.')
+        pattern_converted = self._words2bytes(pattern)
+        if mask:
+            if len(pattern) != len(mask):
+                raise ValueError('pattern and mask must be of same size.')
+        else:
+            mask = [2**self.data_bits-1]*len(pattern)
+
+        mask_converted = self._words2bytes(mask)
+
+        self.fpga_write(self.REG_TRACE_PATTERN0+index, pattern_converted)
+        self.fpga_write(self.REG_TRACE_MASK0+index, mask_converted)
         # count trailing zeros in the mask, as these determine how much time elapses from
         # the start of receiving a trace packet, until the match is determined -- so that the
         # recorded timestamp can be rolled back to when the trace packet began
         trailing_zeros = 0
-        for m in mask[::-1]:
+        for m in mask_converted[::-1]:
             if not m:
                 trailing_zeros += 1
         self.rule_length[index] = 8-trailing_zeros
+        if enable_rule:
+            rawrules = self.fpga_read(self.REG_PATTERN_ENABLE, 1)[0]
+            rawrules |= 2**index
+            self.fpga_write(self.REG_PATTERN_ENABLE, [rawrules])
 
 
-    def arm_trace(self):
+    def arm_trace(self, check_uart=True):
         """Arms trace sniffer for capture; also checks sync status.
+        When used as part of Husky, it's possible for forego this and have the
+        trace module be armed by the regular Husky arm, by setting
+        :code:`scope.trace.capture.use_husky_arm` to True.
+        Args:
+            check_uart (bool): check that the hardware UART state machine is not stuck,
+            and if it is, reset it. Should not be required unless trace is left enabled
+            when not used. Trace clock needs to be active for this to work.
         """
         assert self.trace_synced, 'Not synchronized!'
         assert self.enabled, 'Not enabled!'
+        if check_uart and self.swo_mode:
+            if self.uart_state != 'ERX_IDLE':
+                tracewhisperer_logger.warning("UART appears stuck, resetting it...")
+                self._uart_reset()
+                assert self.uart_state == 'ERX_IDLE', 'UART is still stuck!'
         self.fpga_write(self.REG_ARM, [1])
-
 
     @property
     def errors(self):
@@ -586,13 +685,30 @@ class TraceWhisperer(util.DisableNewAttr):
 
     @property
     def trace_synced(self):
-        """Check whether the chosen front-end clock is alive, and, for 
-           parallel trace mode, whether we are seeing valid sync frames.
+        """Check whether:
+        1. the chosen front-end clock is alive;
+        2. for parallel trace mode, whether we are seeing valid sync frames;
+        3. for SWO mode, whether UART settings are what they should be (Husky platform only)
         """
-        if self.clock.fe_clock_alive and self.fpga_read(self.REG_SYNCHRONIZED, 1)[0] == 1:
+        if not self.clock.fe_clock_alive:
+            tracewhisperer_logger.error('Front-end clock is not alive! Check scope.trace.clock settings.')
+        if self.swo_mode and (self.platform == 'Husky') and (self.parity != 'none' or self.stop_bits != 1 or self.data_bits != 8):
+            tracewhisperer_logger.warning('UART Rx is not set to 8-N-1; this will prevent correct trace operation. Run restore_uart() to resolve this.')
+        if self.fpga_read(self.REG_SYNCHRONIZED, 1)[0] == 1:
             return True
         else:
             return False
+
+    def restore_uart(self):
+        """Convenience method to set the UART receiver settings to 8-N-1,
+        as required by trace in SWO mode (8 bits data, no parity, 1 stop bit).
+        """
+        if self.platform == 'Husky':
+            self.parity = 'none'
+            self.stop_bits = 1 
+            self.data_bits = 8
+        else:
+            tracewhisperer_logger.warning("Not supported on this platform.")
 
 
     def resync(self):
@@ -608,7 +724,11 @@ class TraceWhisperer(util.DisableNewAttr):
     def is_done(self):
         """Calls SimpleSerial target's is_done().
         """
-        return self._ss.is_done()
+        if self._ss:
+            return self._ss.is_done()
+        else:
+            tracewhisperer_logger.error("Target must be connected for this to work (e.g. scope.trace.target = target)")
+            return False
 
 
     def fpga_write(self, addr, data):
@@ -969,6 +1089,137 @@ class TraceWhisperer(util.DisableNewAttr):
             binout.write(bytes(frame[1]))
         binout.close()
 
+    @property 
+    def parity(self):
+        """Parity setting for the UART receiver. Only available on the Husky
+        platform.  For trace operation this should always be set to 'none'. The
+        option to turn on parity is provided because on the Husky platform, the
+        same UART receiver that is used for trace is also used as a receiver
+        for triggering on generic UART traffic.
+        Args:
+            value: 'none' / 'even' / 'odd'
+        """
+        if self.platform == 'Husky':
+            raw = self.fpga_read(self.REG_UART_PARITY_SETTING, 1)[0] & 0x03
+            if raw == 0:
+                return 'none'
+            elif raw == 3:
+                return 'odd'
+            elif raw == 2:
+                return 'even'
+            else:
+                raise ValueError('Unexpected register value %d' % raw)
+        else:
+            return 'none'
+
+    @parity.setter 
+    def parity(self, value):
+        if self.platform == 'Husky':
+            if value == 'none':
+                raw = 0
+            elif value == 'odd':
+                raw = 3
+            elif value == 'even':
+                raw = 2
+            else:
+                raise ValueError('illegal setting: use "none"/"odd"/"even"')
+            setting = self.fpga_read(self.REG_UART_PARITY_SETTING, 1)[0]
+            # don't touch bit 2:
+            setting &= 0x04
+            setting |= raw
+            self.fpga_write(self.REG_UART_PARITY_SETTING, [setting])
+        else:
+            tracewhisperer_logger.warning("Not supported on this platform.")
+
+    @property 
+    def accept_parity_errors(self):
+        """Only available on the Husky platform. Has no effect on trace
+        operation.  For UART-based triggering, control whether UART words with
+        parity errors are accepted into the pattern match. If set, the pattern
+        match logic treats UART words with parity errors as though they were
+        never received.  Consider this example where uppercase letters
+        represent the UART words received, ^ indicates a parity error, and the
+        programmed pattern is [A,B,C,D}:
+        1. [A,B,C^,D]: if accept_parity_errors is set, the pattern match will
+        trigger; otherwise it will not.
+        2. [A,B,C^,C,D]: if accept_parity_errors is set, the pattern match will
+        *not* trigger; otherwise it *will* trigger.
+        Args:
+            value (bool)
+        """
+        if self.platform == 'Husky':
+            raw = self.fpga_read(self.REG_UART_PARITY_SETTING, 1)[0] & 0x04
+            if raw:
+                return True
+            else:
+                return False
+        else:
+            return None
+
+    @accept_parity_errors.setter 
+    def accept_parity_errors(self, value):
+        if self.platform == 'Husky':
+            if value:
+                raw = 4
+            else:
+                raw = 0
+            setting = self.fpga_read(self.REG_UART_PARITY_SETTING, 1)[0]
+            setting = setting & (raw + 3) # don't clear bits 1:0
+            # don't touch bits 1:0:
+            setting &= 0x03
+            setting |= raw
+            self.fpga_write(self.REG_UART_PARITY_SETTING, [setting])
+        else:
+            tracewhisperer_logger.warning("Not supported on this platform.")
+
+    @property 
+    def stop_bits(self):
+        """Number of stop bits for the UART receiver. Only available on the
+        Husky platform.  For trace operation this should always be set to 1.
+        The option to set this to 2 is provided because on the Husky platform,
+        the same UART receiver that is used for trace is also used as a
+        receiver for triggering on generic UART traffic.
+        Args:
+            value (int): 1 or 2
+        """
+        if self.platform == 'Husky':
+            return self.fpga_read(self.REG_UART_STOP_BITS, 1)[0]
+        else:
+            return 1
+
+    @stop_bits.setter 
+    def stop_bits(self, value):
+        if self.platform == 'Husky':
+            if value not in [1,2]:
+                raise ValueError("Illegal setting: only 1 or 2 allowed")
+            self.fpga_write(self.REG_UART_STOP_BITS, [value])
+        else:
+            tracewhisperer_logger.warning("Not supported on this platform.")
+
+    @property 
+    def data_bits(self):
+        """Number of data bits per word for the UART receiver. Only available
+        on the Husky platform.  For trace operation this should always be set
+        to 8.  The option to set this to [5,9] is provided because on the Husky
+        platform, the same UART receiver that is used for trace is also used as
+        a receiver for triggering on generic UART traffic.
+        Args:
+            value (int): minimum 5, maximum 9
+        """
+        if self.platform == 'Husky':
+            return self.fpga_read(self.REG_UART_DATA_BITS, 1)[0]
+        else:
+            return 8
+
+    @data_bits.setter 
+    def data_bits(self, value):
+        if self.platform == 'Husky':
+            if value not in range(5,10):
+                raise ValueError("Illegal setting: must be in range(5,10)")
+            self.fpga_write(self.REG_UART_DATA_BITS, [value])
+        else:
+            tracewhisperer_logger.warning("Not supported on this platform.")
+
 
 
 class clock(util.DisableNewAttr):
@@ -980,10 +1231,17 @@ class clock(util.DisableNewAttr):
         super().__init__()
         self.main = main
         if self.main.platform == 'Husky':
-            self.drp = XilinxDRP(main, ADDR_LA_DRP_DATA, ADDR_LA_DRP_ADDR, ADDR_LA_DRP_RESET)
+            self.swo_drp = XilinxDRP(main, ADDR_LA_DRP_DATA, ADDR_LA_DRP_ADDR, ADDR_LA_DRP_RESET)
         else:
-            self.drp = XilinxDRP(main, main.REG_TRIGGER_DRP_DATA, main.REG_TRIGGER_DRP_ADDR, main.REG_TRIGGER_DRP_RESET)
-        self.mmcm = XilinxMMCMDRP(self.drp)
+            self.swo_drp = XilinxDRP(main, main.REG_TRIGGER_DRP_DATA, main.REG_TRIGGER_DRP_ADDR, main.REG_TRIGGER_DRP_RESET)
+        self.traceclk_drp = XilinxDRP(main, main.REG_TRACECLK_DRP_DATA, main.REG_TRACECLK_DRP_ADDR, main.REG_TRACECLK_DRP_RESET)
+        self.swo_mmcm = XilinxMMCMDRP(self.swo_drp)
+        self.traceclk_mmcm = XilinxMMCMDRP(self.traceclk_drp)
+        self._warning_frequency = 250e6
+        self._trace_clock_shift_steps = 0
+        self._trace_clock_vco = 0
+        self._trace_clock_muldiv = 0
+        self._timeout = 1
         self.disable_newattr()
 
     def _dict_repr(self):
@@ -992,11 +1250,15 @@ class clock(util.DisableNewAttr):
         if self.main.platform == 'CW610' or self.main.platform == 'Husky':
             rtn['fe_clock_src']     = self.fe_clock_src
         if self.main.platform == 'Husky':
-            #rtn['clkgen_enabled'] = self.main._scope.LA.clkgen_enabled
             rtn['clkgen_enabled'] = self.clkgen_enabled
         rtn['fe_freq']          = self.fe_freq
         rtn['swo_clock_locked']   = self.swo_clock_locked
         rtn['swo_clock_freq']     = self.swo_clock_freq
+        if self.fe_clock_src == 'trace_clock':
+            rtn['trace_clock_shift_enable'] = self.trace_clock_shift_enable
+            rtn['trace_clock_shift_locked'] = self.trace_clock_shift_locked
+            rtn['trace_clock_shift_steps'] = self.trace_clock_shift_steps
+            rtn['trace_clock_shift_range'] = self.trace_clock_shift_range
         return rtn
 
     def __repr__(self):
@@ -1007,7 +1269,7 @@ class clock(util.DisableNewAttr):
 
     @property
     def clkgen_enabled(self):
-        """Controls whether the Xilinx MMCM used to generate the samplign clock
+        """Controls whether the Xilinx MMCM used to generate the sampling clock
         is powered on or not.  7-series MMCMs are power hungry. In the Husky
         FPGA, MMCMs are estimated to consume close to half of the FPGA's power.
         If you run into temperature issues and don't require the logic analyzer
@@ -1038,42 +1300,46 @@ class clock(util.DisableNewAttr):
         return freq
 
     @swo_clock_freq.setter
-    def swo_clock_freq(self, freq, vcomin=600e6, vcomax=1200e6):
+    def swo_clock_freq(self, freq, vcomin=600e6, vcomax=1200e6, threshold=0.01):
         """Calculate Multiply & Divide settings based on input frequency"""
-        if not self.fe_clock_alive:
+        if self.main.enabled and not self.fe_clock_alive:
             tracewhisperer_logger.error("FE clock not present, cannot calculate proper M/D settings")
         if self.main.platform == 'Husky':
-            assert self.main._scope.LA.clk_source == 'pll'
-            input_freq = self.main._scope.clock.clkgen_freq
-            factor = int(freq / input_freq)
-            # TODO: dunno why but calling set_sec_div with anything other than 1 doesn't work, so for now let's
-            # just do it this way, but really we should be using 'best' as calculated below!
-            # Check that DRP object has the right addresses???
-            self.mmcm.set_mul(factor)
-            self.mmcm.set_main_div(1)
-            self.mmcm.set_sec_div(1)
+            input_freq = self.main._scope.LA.source_clock_frequency
         else:
             input_freq = self.fe_freq
-            lowerror = 1e99
-            best = (0,0,0)
-            for maindiv in range(1,6):
-                mmin = int(np.ceil(vcomin/input_freq*maindiv))
-                mmax = int(np.ceil(vcomax/input_freq*maindiv))
-                for mul in range(mmin,mmax+1):
-                    if mul/maindiv < vcomin/input_freq or mul/maindiv > vcomax/input_freq or mul >= 2**7:
-                        continue
-                    for secdiv in range(1,127):
-                        calcfreq = input_freq*mul/maindiv/secdiv
-                        err = abs(freq - calcfreq)
-                        if err < lowerror:
-                            lowerror = err
-                            best = (mul, maindiv, secdiv)
-            if best == (0,0,0):
-                tracewhisperer_logger.error("Couldn't find a legal div/mul combination")
-            self.mmcm.set_mul(best[0])
-            self.mmcm.set_main_div(best[1])
-            self.mmcm.set_sec_div(best[2])
-
+        lowerror = 1e99
+        best = (0,0,0)
+        for maindiv in range(1,6):
+            mmin = int(np.ceil(vcomin/input_freq*maindiv))
+            mmax = int(np.ceil(vcomax/input_freq*maindiv))
+            for mul in range(mmin,mmax+1):
+                if mul/maindiv < vcomin/input_freq or mul/maindiv > vcomax/input_freq or mul >= 2**7:
+                    continue
+                for secdiv in range(1,127):
+                    calcfreq = input_freq*mul/maindiv/secdiv
+                    err = abs(freq - calcfreq)
+                    if err < lowerror:
+                        lowerror = err
+                        best = (mul, maindiv, secdiv)
+        if best == (0,0,0):
+            tracewhisperer_logger.error("Couldn't find a legal div/mul combination")
+        else:
+            self.swo_mmcm.set_mul(best[0])
+            self.swo_mmcm.set_main_div(best[1])
+            self.swo_mmcm.set_sec_div(best[2])
+            actual = input_freq*best[0]/best[1]/best[2]
+            if abs(actual-freq)/freq*100 > threshold:
+                scope_logger.warning("Coudln't achieve exact desired frequency (%f); setting to %f instead." % (freq, input_freq*best[0]/best[1]/best[2]))
+            time.sleep(0.1)
+            if freq > self._warning_frequency:
+                scope_logger.warning("""
+                    Clock frequency exceeds specification (250 MHz). 
+                    This may or may not work, depending on temperature, voltage, and luck.
+                    It may not work reliably.
+                    You can adjust trace.clock._warning_frequency if you don't want
+                    to see this message anymore.
+                    """)
 
     @property
     def fe_clock_alive(self):
@@ -1098,6 +1364,9 @@ class clock(util.DisableNewAttr):
     @property
     def fe_clock_src(self):
         """Choose which clock is used as the front-end clock.
+        On the CW305 platform, "target_clock" is the only option.
+        On Husky, "target_clock" refers to either the target-generated clock or
+        Husky-generated clock, as per :code:`scope.clock.clkgen_src`.
         Args:
             src (str): "target_clock", "trace_clock" or "usb_clock"
         """
@@ -1116,18 +1385,138 @@ class clock(util.DisableNewAttr):
 
     @fe_clock_src.setter
     def fe_clock_src(self, src):
+        if src != 'target_clock' and self.main.platform == 'CW305':
+            raise ValueError("Not supported on CW305. Use 'target_clock'")
         if src == 'target_clock':
             val = 0
         elif src == 'trace_clock':
             val = 1
-            if self.main.platform == 'Husky':
-                tracewhisperer_logger.warning("trace_clock may not sample trace data properly on Husky; recommend using target_clock instead.")
         elif src == 'usb_clock':
             val = 2
         else:
             raise ValueError('Invalid source (target_clock/trace_clock/usb_clock)')
         self.main.fpga_write(self.main.REG_FE_CLOCK_SEL, [val])
 
+    @property
+    def trace_clock_shift_enable(self):
+        """Turn on the MMCM for shifting the trace clock. When disabled, the
+        raw input trace clock is used; when enabled, the MMCM-shifted trace
+        clock is used.
+        Args:
+            enable (bool)
+        """
+        raw = self.main.fpga_read(self.main.REG_TRACECLK_SHIFT_EN, 1)[0]
+        if raw:
+            return True
+        else:
+            return False
+
+    @trace_clock_shift_enable.setter
+    def trace_clock_shift_enable(self, enable):
+        if enable:
+            val = 1
+        else:
+            val = 0
+        self.main.fpga_write(self.main.REG_TRACECLK_SHIFT_EN, [val])
+
+    @property
+    def trace_clock_shift_steps(self):
+        """The trace clock phase shift. There are
+        `trace.clock.trace_clock_shift_range` steps in a full period of the
+        trace clock (the trace clock frequency *must* be specified by calling
+        `trace.clock.trace_clock_set_freq()` in order for this to be accurate).
+
+        Negative values are allowed, but -x is equivalent to
+        `trace.clock.trace_clock_shift_range - x`. The setting rolls over (+x
+        is equivalent to `trace.clock.trace_clock_shift_range + x`). Run the
+        trace_clock_alignment.ipynb notebook in the DesignStartTrace repository
+        to visualize phase shift settings.
+
+        Args:
+            steps (signed 16-bit integer): number of phase shift steps.
+        """
+        return self._trace_clock_shift_steps
+
+    @trace_clock_shift_steps.setter
+    def trace_clock_shift_steps(self, steps):
+        if not (self.trace_clock_shift_enable and self.trace_clock_shift_locked):
+            raise ValueError("Can't change settings if not enabled and locked.")
+        assert type(steps) == int
+        LSB = steps & 0x00FF
+        MSB = (steps & 0xFF00) >> 8
+        self.main.fpga_write(self.main.REG_TRACECLK_PHASE, [LSB, MSB])
+        # Large adjustments can take a while so it's important to check if done.
+        starttime = datetime.datetime.now()
+        done = False
+        while not done:
+            diff = datetime.datetime.now() - starttime
+            if (diff.total_seconds() > self._timeout):
+                scope_logger.warning('Timeout in phase adjustment. Increase self._timeout. This should not be necessary unless you make *huge* step jumps.')
+                break
+            raw = self.main.fpga_read(self.main.REG_TRACECLK_PHASE, 1)[0]
+            done = raw & 0x01
+        self._trace_clock_shift_steps = steps
+
+    @property
+    def trace_clock_shift_locked(self):
+        """Indicates whether the MMCM (PLL) for the trace clock phase shift is
+        locked.  If this is False, make sure that the trace clock is present
+        (CK pin of the USERIO header), and that `trace_clock_set_freq()` has
+        been called to specify the trace clock frequency.
+        """
+        raw = self.main.fpga_read(self.main.REG_TRACECLK_PHASE, 1)[0]
+        if raw & 0x02:
+            return True
+        else:
+            return False
+
+    @property
+    def trace_clock_shift_range(self):
+        """Returns number of phase shift steps in one trace pll cycle.  This
+        is simply 56 times the MMCM's multiplier, indepedent of the trace
+        clock frequency.  (ref: Xilinx UG472 v1.14, "Dynamic Phase Shift
+        Interface in the MMCM")
+        The trace clock frequency must be provided via `trace_clock_set_freq()`
+        in order for this to be accurate.  The number of phase shift steps
+        depends on the clock frequency (fewer steps as the frequency increases)
+        and on the PLL VCO frequency which can also be specified via
+        `trace_clock_set_freq()` (more steps as the VCO increases).
+        """
+        return self._trace_clock_muldiv * 56
+
+    def trace_clock_set_freq(self, freq, vco=600e6):
+        """Use this to specify the trace clock frequency. This is important for
+        (a) operating the phase shift MMCM in its allowed operating range, and
+        (b) accurately determining the number of phase shift steps per clock
+        period. The MMCM's VCO frequency can optionally be specified. Note that
+        the trace clock frequency is usually half of the target's clock
+        frequency.
+        Args:
+            freq (int): trace clock frequency. Minimum: 5 MHz.
+            vco (int): VCO frequency. Allowed range [600e6, 1200e6]. Higher
+                    values allow finer phase adjustments but consume more
+                    power.  Default: 600 MHz.
+        """
+        if vco > 1200e6 or vco < 600e6:
+            raise ValueError("Requested VCO out of range")
+
+        # The following changes resets the phase shift setting, but just
+        # resetting the internal (Python) phase setting doesn't work as one
+        # would expect; resetting the actual FPGA MMCM phase is needed to get
+        # consistent results.
+        if self.trace_clock_shift_enable and self.trace_clock_shift_locked:
+            self.trace_clock_shift_steps = 0
+
+        muldiv = int(np.ceil(vco/freq))
+        if freq * muldiv > 1200e6:
+            muldiv -= 1
+        self._trace_clock_vco = freq * muldiv
+
+        tracewhisperer_logger.info("Setting vco {}, muldiv: {}".format(vco, muldiv))
+        self.traceclk_mmcm.set_mul(muldiv)
+        self.traceclk_mmcm.set_sec_div(muldiv)
+        self.traceclk_mmcm.set_main_div(1)
+        self._trace_clock_muldiv = muldiv
 
 
 class capture(util.DisableNewAttr):
@@ -1139,14 +1528,21 @@ class capture(util.DisableNewAttr):
         super().__init__()
         self.main = main
         self.disable_newattr()
+        if self.main.platform == 'Husky':
+            self.use_husky_arm = False
 
     def _dict_repr(self):
         rtn = OrderedDict()
         rtn['trigger_source']           = self.trigger_source
+        if self.main.platform == 'Husky':
+            rtn['use_husky_arm']        = self.use_husky_arm
         rtn['raw']                      = self.raw
         rtn['rules_enabled']            = self.rules_enabled
+        rtn['rules']                    = self.rules
         rtn['mode']                     = self.mode
         rtn['count']                    = self.count
+        rtn['max_triggers']             = self.max_triggers
+        rtn['triggers_generated']       = self.triggers_generated
         rtn['record_syncs']             = self.record_syncs
         rtn['matched_pattern_data']     = self.matched_pattern_data
         rtn['matched_pattern_counts']   = self.matched_pattern_counts
@@ -1211,6 +1607,35 @@ class capture(util.DisableNewAttr):
         """
         return list(self.main.fpga_read(self.main.REG_TRACE_COUNT, 8)[::-1])
 
+    @property
+    def max_triggers(self):
+        """ Maximum number of triggers to generate. Intended for trace-based 
+            triggering (i.e. :code:`scope.trigger.module = 'trace'`), where the trace
+            event(s) which can generate a trigger can occur multiple times
+            (e.g. the start of an AES round). Setting this to 'x' does not mean
+            that 'x' triggers will be generated, it means that *up to* 'x'
+            triggers can be generated. This parameter is needed so that the
+            trace module knows when it is 'done'; it's also useful to
+            coordinate with e.g.  segmented capture parameters
+            (:code:`scope.adc.segments`).
+        Args:
+            number (int): number from 1 to 2**16-1.
+        """
+        return int.from_bytes(self.main.fpga_read(self.main.REG_NUM_TRIGGERS, 2), byteorder='little')
+
+    @max_triggers.setter
+    def max_triggers(self, number):
+        if not 0 < number < 2**16:
+            raise ValueError("Out of allowed range")
+        else:
+            self.main.fpga_write(self.main.REG_NUM_TRIGGERS, int.to_bytes(number, length=4, byteorder='little'))
+
+    @property
+    def triggers_generated(self):
+        """ Number of triggers that were generated on the last capture cycle.
+        """
+        return self.main.fpga_read(self.main.REG_TRIGGERS_GENERATED, 1)[0]
+
 
     @property
     def trigger_source(self):
@@ -1254,29 +1679,39 @@ class capture(util.DisableNewAttr):
             mode (string): 'while_trig': capture while the trigger input is high
                            'count_cycles': capture for self.count clock cycles
                            'count_writes': capture self.count events
+                           'off': capture disabled (e.g. for trigger generation only)
         """
-        raw = self.main.fpga_read(self.main.REG_CAPTURE_WHILE_TRIG, 1)[0]
+        raw = self.main.fpga_read(self.main.REG_CAPTURE_OFF, 1)[0]
         if raw:
-            return "while_trig"
+            return "off"
         else:
-            raw = self.main.fpga_read(self.main.REG_COUNT_WRITES, 1)[0]
+            raw = self.main.fpga_read(self.main.REG_CAPTURE_WHILE_TRIG, 1)[0]
             if raw:
-                return "count_writes"
+                return "while_trig"
             else:
-                return "count_cycles"
+                raw = self.main.fpga_read(self.main.REG_COUNT_WRITES, 1)[0]
+                if raw:
+                    return "count_writes"
+                else:
+                    return "count_cycles"
 
     @mode.setter
     def mode(self, mode):
-        if mode == 'while_trig':
+        if mode == 'off':
+            self.main.fpga_write(self.main.REG_CAPTURE_OFF, [1])
+        elif mode == 'while_trig':
+            self.main.fpga_write(self.main.REG_CAPTURE_OFF, [0])
             self.main.fpga_write(self.main.REG_CAPTURE_WHILE_TRIG, [1])
         elif mode == 'count_cycles':
+            self.main.fpga_write(self.main.REG_CAPTURE_OFF, [0])
             self.main.fpga_write(self.main.REG_CAPTURE_WHILE_TRIG, [0])
             self.main.fpga_write(self.main.REG_COUNT_WRITES, [0])
         elif mode == 'count_writes':
+            self.main.fpga_write(self.main.REG_CAPTURE_OFF, [0])
             self.main.fpga_write(self.main.REG_CAPTURE_WHILE_TRIG, [0])
             self.main.fpga_write(self.main.REG_COUNT_WRITES, [1])
         else:
-            tracewhisperer_logger.error('Invalid mode %s')
+            tracewhisperer_logger.error('Invalid mode %s', mode)
 
     @property
     def count(self):
@@ -1313,6 +1748,34 @@ class capture(util.DisableNewAttr):
             raw += 2**rule
         self.main.fpga_write(self.main.REG_PATTERN_ENABLE, [raw])
 
+    @property
+    def rules(self):
+        """Use set_pattern_match() to set these.
+        """
+        rulez = []
+        for e in self.rules_enabled:
+            rulez.append({'rule':e, 'patt':self.main.fpga_read(self.main.REG_TRACE_PATTERN0+e, 8), 'mask':self.main.fpga_read(self.main.REG_TRACE_MASK0+e, 8)})
+        return rulez
+
+    @property
+    def use_husky_arm(self):
+        """ When used as part of Husky, it's possible for forego this and have
+        the trace/UART module be armed by the regular Husky arm, by setting
+        this to True.
+        """
+        val = self.main.fpga_read(self.main.REG_EXTERNAL_ARM, 1)[0]
+        if self.main.platform != 'Husky':
+            tracewhisperer_logger.error("Applicable to Husky only")
+            return False
+        elif val:
+            return True
+        else:
+            return False
+
+    @use_husky_arm.setter
+    def use_husky_arm(self, val):
+        if self.main.platform == 'Husky':
+            self.main.fpga_write(self.main.REG_EXTERNAL_ARM, [val])
 
 
 class ARM_debug_registers(util.DisableNewAttr):
@@ -1339,9 +1802,6 @@ class ARM_debug_registers(util.DisableNewAttr):
 
     def __init__(self, main):
         super().__init__()
-        # oaiface = OpenADCInterface
-        #self._ss = main._ss
-        #self._ss = serial
         self.main = main
         self.cached_values = [None] * len(self.regs)
         self.disable_newattr()
@@ -1524,10 +1984,241 @@ class ARM_debug_registers(util.DisableNewAttr):
                 data = '%02x' % self.regs[reg] + '00000000'
                 self.main._ss.simpleserial_write('g', util.hexStrToByteArray(data))
                 time.sleep(0.1)
-                val = int(self.main._ss.read().split('\n')[0][1:], 16)
-                self.cached_values[self.regs[reg]] = val
+                try:
+                    val = int(self.main._ss.read().split('\n')[0][1:], 16)
+                    self.cached_values[self.regs[reg]] = val
+                except Exception as e:
+                    scope_logger.error("Can't read trace register. Perhaps target firmware doesn't support it? See simpleserial-trace for an example of what's required. " + str(e))
+                    val = 0
             return '%08x' % val
         else:
             tracewhisperer_logger.error('Register %s does not exist.', reg)
+
+
+
+class UARTTrigger(TraceWhisperer):
+    ''' Husky UART trigger module settings.
+    Basic usage for triggering on 'r'::
+
+        #assuming setup scope:
+        scope.trigger.triggers = 'tio1'
+        scope.trigger.module = 'UART'
+        scope.UARTTrigger.enabled = True
+        scope.UARTTrigger.baud = 38400
+        scope.UARTTrigger.set_pattern_match(0, 'r')
+        scope.UARTTrigger.trigger_source = 0
+
+    TraceWhisperer runs on the same hardware as this, so configuration changes
+    in one affects the other and vice-versa.
+    '''
+    _name = 'UART Trigger Module'
+
+    def __init__(self, scope, trace_reg_select, main_reg_select):
+        self._baud = 0
+        self._baud_margin = 0.005
+        super().__init__(husky=True, target=None, scope=scope, trace_reg_select=trace_reg_select, main_reg_select=main_reg_select)
+        self.disable_newattr()
+        self.trigger_source = 0
+
+    def _dict_repr(self):
+        rtn = OrderedDict()
+        rtn['enabled'] = self.enabled
+        rtn['baud'] = self.baud
+        rtn['data_bits'] = self.data_bits
+        rtn['stop_bits'] = self.stop_bits
+        rtn['parity'] = self.parity
+        rtn['accept_parity_errors'] = self.accept_parity_errors
+        rtn['sampling_clock'] = self.sampling_clock
+        rtn['trigger_source'] = self.trigger_source
+        rtn['rules_enabled'] = self.rules_enabled
+        rtn['rules'] = self.rules
+        #rtn['matched_pattern_data'] = self.matched_pattern_data
+        rtn['matched_pattern_counts'] = self.matched_pattern_counts
+        return rtn
+
+    def __repr__(self):
+        return util.dict_to_str(self._dict_repr())
+
+    def __str__(self):
+        return self.__repr__()
+
+    @property 
+    def enabled(self):
+        """Controls whether trace data collecting is enabled or not. Mostly affects configuration
+        of the front 20-pin header.
+        Args:
+            enable (bool)
+        """
+        return super().enabled
+
+    @enabled.setter 
+    def enabled(self, enable):
+        if enable:
+            # set useful defaults:
+            self.trace_mode = 'swo'
+            self.capture.mode = 'off'
+            self.clock.fe_clock_src = 'target_clock'
+            self.capture.record_syncs = True
+            self.capture.use_husky_arm = True
+        # accessing base class setter is awkward! all we want to do here is super().enabled = enable, but this is the way to do that:
+        super(UARTTrigger, self.__class__).enabled.fset(self, enable)
+
+    @property 
+    def rules_enabled(self):
+        """Shortcut to self.capture.rules_enabled
+        """
+        return self.capture.rules_enabled
+
+    @rules_enabled.setter 
+    def rules_enabled(self, enable):
+        self.capture.rules_enabled = enable
+
+    @property 
+    def rules(self):
+        """Shortcut to self.capture.rules
+        """
+        return self.capture.rules
+
+    @property
+    def baud(self):
+        """ Set the desired baud rate.
+        """
+        return self._baud
+
+    @baud.setter
+    def baud(self, req_baud):
+        found = False
+        freq_mul = 2 # TODO: should be able to use 1, but MMCM doesn't work correctly at that setting
+        sample_freq = self.clock.fe_freq * freq_mul
+        while True:
+            div = int(sample_freq / req_baud)
+            actual_baud = sample_freq / div
+            if abs(req_baud-actual_baud)/req_baud < self._baud_margin:
+                found = True
+                break
+            freq_mul += 1
+            sample_freq = self.clock.fe_freq * freq_mul
+            if sample_freq > 200e6:
+                break
+        if found:
+            self.clock.swo_clock_freq = sample_freq
+            if not self.clock.swo_clock_locked:
+                tracewhisperer_logger.error("SWO clock not locked!")
+            self.swo_div = div
+            self._baud = actual_baud
+            tracewhisperer_logger.info("Setting baudrate to %d (freq_mul=%d)" % (actual_baud, freq_mul))
+        else:
+            tracewhisperer_logger.error("Couldn't find parameters for requested baud rate. Try increasing scope.uart._baud_margin.")
+
+
+    @property
+    def sampling_clock(self):
+        """ Shorthand for accessing the measured frequency of the sampling clock.
+            Indirectly set via 'baud' setting.
+        """
+        return self.clock.swo_clock_freq
+
+    def uart_data(self, rawdata, prepend_matched_pattern=True, return_ascii=True):
+        """ Helper function to parse the captured UART data.
+        Args:
+            rawdata (list): raw capture data, list of lists, e.g. obtained from read_capture_data()
+            prepend_matched_pattern (bool): 
+            return_ascii (bool): return data as ASCII (otherwise hex)
+        """
+        datalist = []
+        prepend = []
+        if prepend_matched_pattern:
+            for b in self.fpga_read(self.REG_MATCHED_DATA, 8):
+                prepend.append([0, b, self.FE_FIFO_CMD_STAT])
+        for raw in prepend+rawdata:
+            command = raw[2] & 0x3
+            if command == self.FE_FIFO_CMD_STAT:
+                data = raw[1]
+                if return_ascii:
+                    datalist.append(chr(data))
+                else:
+                    datalist.append(data)
+            elif command == self.FE_FIFO_CMD_DATA:
+                print("Unexpected data command.")
+        return datalist
+
+
+    def matched_pattern_data(self, as_string=True):
+        """ Return the actual trace data seen for the last matched pattern.
+        Args:
+            as_string (bool): convert each byte to its boolean string; otherwise,
+            results are returned as a list of self.data_bits-sized words.
+        """
+        raw = self.fpga_read(self.REG_MATCHED_DATA, 8)
+        if as_string:
+            string = ''
+            for b in raw:
+                string += chr(b)
+            return string
+        else:
+            word_size = self.data_bits
+            bigword = 0
+            for i,w in enumerate(raw):
+                bigword += (w << (8*i))
+            pattern = []
+            while bigword:
+                pattern.append((bigword & ((2**word_size-1) << 64-word_size)) >> (64-word_size))
+                bigword <<= word_size
+                bigword &= 2**64-1
+            return pattern[::-1]
+
+    @property
+    def matched_pattern_counts(self):
+        """ Return the actual trace data seen for the last matched pattern.
+        """
+        return self.capture.matched_pattern_counts
+
+
+    @property
+    def trigger_source(self):
+        """ Set which pattern match rule is used to generate a trigger.
+        Args:
+            rule (int)
+        """
+        if self.fpga_read(self.REG_SOFT_TRIG_ENABLE, 1)[0]:
+            return('firmware trigger')
+        else:
+            raw = self.fpga_read(self.REG_PATTERN_TRIG_ENABLE, 1)[0]
+            if raw > 0:
+                return('rule #%d' % int(math.log2(raw)))
+            else:
+                return('no rule set!')
+
+    @trigger_source.setter
+    def trigger_source(self, rule):
+        if 0 <= rule < 8:
+            self.fpga_write(self.REG_SOFT_TRIG_ENABLE, [0])
+            self.fpga_write(self.REG_SOFT_TRIG_PASSTHRU, [0])
+            self.fpga_write(self.REG_PATTERN_TRIG_ENABLE, [2**rule])
+            self.fpga_write(self.REG_TRIGGER_ENABLE, [1])
+        else:
+            raise ValueError
+
+    def set_pattern_match(self, index, pattern, mask=None, enable_rule=True):
+        """Sets pattern match and mask parameters.  The pattern may be
+        specified as a string (if the UART word size is 8 bits), or as a list
+        of self.data_bits-sized integers (as is done for trace).  
+        Refer to set_pattern_match() documentation in parent TraceWhisperer
+        class for more details.
+
+        Args:
+            index: match index [0-7]
+            pattern: string or list of self.data_bits-sized integers.
+                Maximum size given by self.pattern_size.
+            mask (list, optional): list of self.data_bits-sized integers, 
+                must have same size as 'pattern' if set.
+
+        """
+        if type(pattern) is str:
+            lpattern = []
+            for c in pattern:
+                lpattern.append(ord(c))
+            pattern = lpattern
+        super().set_pattern_match(index, pattern, mask, enable_rule)
 
 

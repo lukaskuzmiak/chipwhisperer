@@ -77,7 +77,7 @@ class TargetTemplate:
     def output_len(self, length):
         return 16
 
-    def _con(self, scope=None):
+    def _con(self, scope=None, **kwargs):
         raise NotImplementedError
 
     def flush(self):
@@ -163,3 +163,9 @@ class TargetTemplate:
 
     def __str__(self):
         return self.__repr__()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.dis()
