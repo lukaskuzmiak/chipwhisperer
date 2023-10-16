@@ -43,6 +43,9 @@ ADDR_SAD_REF_SAMPLES = 104
 ADDR_SAD_COUNTER_WIDTH = 105
 ADDR_SAD_MULTIPLE_TRIGGERS = 106
 ADDR_SAD_SHORT = 107
+ADDR_SAD_REF_BASE = 108
+ADDR_SAD_VERSION = 114
+ADDR_SAD_ALWAYS_ARMED = 116
 
 CODE_READ   = 0x80
 CODE_WRITE  = 0xC0
@@ -220,6 +223,9 @@ class ChipWhispererSAD(util.DisableNewAttr):
 class HuskySAD(util.DisableNewAttr):
     """Communicates with the SAD module inside CW-Husky.
 
+    Because SAD is by far the largest FPGA module, XADC alarms
+    (temperature/voltage) shut down the SAD.
+
     This submodule is only available on ChipWhisperer Husky.
     If you wish for the SAD capture to include the SAD pattern, set
     scope.adc.presamples to scope.SAD.sad_reference_length + scope.SAD.latency
@@ -243,7 +249,6 @@ class HuskySAD(util.DisableNewAttr):
     def __init__(self, oa):
         super().__init__()
         self.oa = oa
-        self.latency = 9 # property of the hardware, due to pipeline delays
         self.disable_newattr()
 
     def _dict_repr(self):
@@ -254,6 +259,7 @@ class HuskySAD(util.DisableNewAttr):
         rtn['half_pattern'] = self.half_pattern
         rtn['multiple_triggers'] = self.multiple_triggers
         rtn['num_triggers_seen'] = self.num_triggers_seen
+        rtn['always_armed'] = self.always_armed
         return rtn
 
     def __repr__(self):
@@ -301,7 +307,22 @@ class HuskySAD(util.DisableNewAttr):
             bits_per_sample: (int, optional): number of bits per sample in
                 wave. If not provided, we use scope.adc.bits_per_sample.
         """
-        return list(self.oa.sendMessage(CODE_READ, ADDR_SAD_REF, Validate=False, maxResp=self.sad_reference_length))
+        if self.sad_reference_length > 128:
+            # in this case we have to read in blocks of 128 bytes:
+            base = 0
+            bytes_read = 0
+            ref = []
+            while bytes_read < self.sad_reference_length:
+                self.oa.sendMessage(CODE_WRITE, ADDR_SAD_REF_BASE, [base])
+                ref.extend(list(self.oa.sendMessage(CODE_READ, ADDR_SAD_REF, Validate=False, maxResp=128)))
+                bytes_read += 128
+                base += 1
+            # reset the base register to normal:
+            self.oa.sendMessage(CODE_WRITE, ADDR_SAD_REF_BASE, [0])
+            return ref[:self.sad_reference_length]
+
+        else:
+            return list(self.oa.sendMessage(CODE_READ, ADDR_SAD_REF, Validate=False, maxResp=self.sad_reference_length))
 
     @reference.setter
     def reference(self, wave, bits_per_sample=None):
@@ -324,7 +345,21 @@ class HuskySAD(util.DisableNewAttr):
             if wave_bits_per_sample == 12:
                 for i in range(len(refints)):
                     refints[i] = refints[i] >> 4
-            self.oa.sendMessage(CODE_WRITE, ADDR_SAD_REF, refints)
+            if len(refints) > 128:
+                # in this case we have to write in blocks of 128 bytes:
+                base = 0
+                bytes_written = 0
+                while bytes_written < len(refints):
+                    self.oa.sendMessage(CODE_WRITE, ADDR_SAD_REF_BASE, [base])
+                    start = base*128
+                    stop = min(start + 128, len(refints))
+                    bytes_written += (stop-start)
+                    self.oa.sendMessage(CODE_WRITE, ADDR_SAD_REF, refints[start:stop])
+                    base += 1
+                # reset the base register to normal:
+                self.oa.sendMessage(CODE_WRITE, ADDR_SAD_REF_BASE, [0])
+            else:
+                self.oa.sendMessage(CODE_WRITE, ADDR_SAD_REF, refints)
 
     @property
     def _sad_bits_per_sample(self):
@@ -345,12 +380,37 @@ class HuskySAD(util.DisableNewAttr):
         """Read-only. Returns the number of samples that are used by the SAD module. Hardware property,
         but can be halved by the half_pattern setting.
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_SAD_REF_SAMPLES, Validate=False, maxResp=1)[0]
+        value = int.from_bytes(self.oa.sendMessage(CODE_READ, ADDR_SAD_REF_SAMPLES, Validate=False, maxResp=2), byteorder='little')
         if self.half_pattern:
             div = 2
         else:
             div = 1
-        return raw//div
+        return value//div
+
+    @property
+    def latency(self):
+        """Read-only. Returns the SAD module's triggering latency. This is implementation-dependent
+        so it is read from an FPGA register.
+        """
+        raw = self.oa.sendMessage(CODE_READ, ADDR_SAD_VERSION, Validate=False, maxResp=1)[0]
+        if raw == 0:
+            # assume this is an earlier bitfile which did not implement the SAD_VERSION register, and assume its latency is 9:
+            return 9
+        else:
+            return raw & 0x3f
+
+    @property
+    def _implementation(self):
+        """Read-only. Indicates which SAD module was used to create the current FPGA bitfile.
+        """
+        raw = self.oa.sendMessage(CODE_READ, ADDR_SAD_VERSION, Validate=False, maxResp=1)[0]
+        version_bits = (raw & 0xc0) >> 6
+        if version_bits == 0:
+            return 'OG'
+        elif version_bits == 1:
+            return 'X2_slow'
+        else:
+            raise ValueError("Unexpected version bits: %d" % version_bits)
 
     @property
     def half_pattern(self):
@@ -410,8 +470,7 @@ class HuskySAD(util.DisableNewAttr):
 
     @property
     def num_triggers_seen(self):
-        """SAD module status.  Intended for debugging.
-        Indicates how many triggers were generated by the SAD module;
+        """ Indicates how many triggers were generated by the SAD module;
         gets cleared by setting this (or triggered) to any value or by
         re-arming.
         """
@@ -421,4 +480,20 @@ class HuskySAD(util.DisableNewAttr):
     @num_triggers_seen.setter
     def num_triggers_seen(self, val):
         self.triggered = val
+
+    @property
+    def always_armed(self):
+        """ Control whether the SAD module can trigger without the scope being
+        armed.  The intended use is to allow the SAD module to trigger after
+        the ADC capture has completed, which can be very useful when
+        calibrating the SAD threshold when using multiple SAD triggers.
+        """
+        if self.oa.sendMessage(CODE_READ, ADDR_SAD_ALWAYS_ARMED, Validate=False, maxResp=1)[0]:
+            return True
+        else:
+            return False
+
+    @always_armed.setter
+    def always_armed(self, val):
+        self.oa.sendMessage(CODE_WRITE, ADDR_SAD_ALWAYS_ARMED, [val])
 

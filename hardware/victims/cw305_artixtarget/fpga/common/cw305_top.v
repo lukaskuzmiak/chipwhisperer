@@ -38,6 +38,9 @@ module cw305_top #(
 )(
     // USB Interface
     input wire                          usb_clk,        // Clock
+`ifdef SS2_WRAPPER
+    output wire                         usb_clk_buf,    // if needed by parent module
+`endif
     inout wire [7:0]                    usb_data,       // Data for write/read
     input wire [pADDR_WIDTH-1:0]        usb_addr,       // Address
     input wire                          usb_rdn,        // !RD, low when addr valid for read
@@ -79,6 +82,9 @@ module cw305_top #(
 `endif
     );
 
+`ifndef SS2_WRAPPER
+    wire usb_clk_buf;
+`endif
 
     wire [pKEY_WIDTH-1:0] crypt_key;
     wire [pPT_WIDTH-1:0] crypt_textout;
@@ -89,7 +95,6 @@ module cw305_top #(
     wire crypt_done;
     wire crypt_busy;
 
-    wire usb_clk_buf;
     wire [7:0] usb_dout;
     wire isout;
     wire [pADDR_WIDTH-pBYTECNT_SIZE-1:0] reg_address;
@@ -178,6 +183,11 @@ module cw305_top #(
     assign usb_data = isout? usb_dout : 8'bZ;
 
 
+`ifdef ICE40
+    assign usb_clk_buf = usb_clk;
+    assign crypt_clk = usb_clk;
+    assign tio_clkout = usb_clk;
+`else
     clocks U_clocks (
        .usb_clk                 (usb_clk),
        .usb_clk_buf             (usb_clk_buf),
@@ -189,6 +199,7 @@ module cw305_top #(
        .O_cw_clkout             (tio_clkout),
        .O_cryptoclk             (crypt_clk)
     );
+`endif
 
 
 

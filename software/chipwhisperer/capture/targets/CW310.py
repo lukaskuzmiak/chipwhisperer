@@ -28,6 +28,7 @@ from ...hardware.naeusb.fpga import FPGA
 from ...logging import *
 from collections import OrderedDict
 from ...common.utils import util
+from ...hardware.naeusb.serial import USART
 
 class CW310(CW305):
     """CW310 Bergen Board target object.
@@ -40,7 +41,7 @@ class CW310(CW305):
 
         # scope can also be None here, unlike with the default SimpleSerial
         target = cw.target(scope,
-                targets.CW310, bsfile=<valid FPGA bitstream file>)
+                cw.targets.CW310, bsfile=<valid FPGA bitstream file>)
 
 
     Inherits the CW305 object, so you can use the same methods as the CW305, provided the register interface
@@ -55,18 +56,20 @@ class CW310(CW305):
         # renegotiate PDO (applies above settings)
         target.usb_negotiate_pdo()
 
-    For more help about CW305 settings, try help() on this CW310 submodule:
+    For more help about CW310 settings, try help() on this CW310 submodule:
 
        * target.pll
     """
     USB_I2C_SETUP = 0x43
     USB_I2C_DATA = 0x44
+    _name = "ChipWhisperer CW310 (Artix-7)"
+
     def __init__(self, *args, **kwargs):
         # maybe later can hijack cw305 stuff, but for now don't
         pass
         import chipwhisperer as cw
         self._naeusb = NAEUSB()
-        self.pll = PLLCDCE906(self._naeusb, ref_freq = 12.0E6)
+        self.pll = PLLCDCE906(self._naeusb, ref_freq = 12.0E6, board="CW310")
         self.fpga = FPGA(self._naeusb)
 
         self.hw = None
@@ -83,6 +86,8 @@ class CW310(CW305):
         self.last_key = bytearray([0]*16)
         self.target_name = 'AES'
         self._io = FPGAIO(self._naeusb, 200)
+        self.toggle_user_led = False
+        self.check_done = False
 
         # TODO- temporary until these are added to the parsed defines file
         self.REG_XADC_DRP_ADDR = 0x17
@@ -93,17 +98,19 @@ class CW310(CW305):
         rtn = OrderedDict()
         rtn['fpga_buildtime'] = self.get_fpga_buildtime()
         rtn['xadc_status'] = self.xadc_status
-        rtn['max temp'] = self.get_xadc_temp(maximum=True)
-        rtn['temp'] = self.get_xadc_temp()
-        rtn['max vccint'] = self.get_xadc_vcc('vccint', maximum=True)
-        rtn['max vccbram'] = self.get_xadc_vcc('vccbram', maximum=True)
-        rtn['max vccaux'] = self.get_xadc_vcc('vccaux', maximum=True)
-        rtn['current vccint'] = self.get_xadc_vcc('vccint')
-        rtn['current vccbram'] = self.get_xadc_vcc('vccbram')
-        rtn['current vccaux'] = self.get_xadc_vcc('vccaux')
-        rtn['vaux0'] = self.get_xadc_vaux(0)
-        rtn['vaux1'] = self.get_xadc_vaux(1)
-        rtn['vaux8'] = self.get_xadc_vaux(8)
+        rtn['max_temp'] = self.max_temp
+        rtn['temp'] = self.temp
+        rtn['max_vccint'] = self.max_vccint
+        rtn['max_vccbram'] = self.max_vccbram
+        rtn['max_vccaux'] = self.max_vccaux
+        rtn['current_vccint'] = self.current_vccint
+        rtn['current_vccbram'] = self.current_vccbram
+        rtn['current_vccaux'] = self.current_vccaux
+        rtn['vaux0'] = self.vaux0
+        rtn['vaux1'] = self.vaux1
+        rtn['vaux8'] = self.vaux8
+        if 'CW340' in self._name:
+            rtn['vaux12'] = self.get_xadc_vaux(12)
         return rtn
 
     def __repr__(self):
@@ -116,10 +123,20 @@ class CW310(CW305):
         from ...hardware.firmware.cwbergen import fwver
         return fwver
         
+    def _get_usart(self, num=0):
+        if num == 0:
+            return self._usart0
+        elif num == 1:
+            return self._usart1
+        else:
+            raise ValueError("Invalid usart {}".format(num))
 
-    def _con(self, scope=None, bsfile=None, force=False, fpga_id=None, defines_files=None, slurp=True, prog_speed=20E6, sn=None, hw_location=None):
+    def _con(self, scope=None, bsfile=None, force=False, fpga_id=None, defines_files=None, slurp=True, prog_speed=20E6, sn=None, hw_location=None, platform='cw310'):
         # add more stuff later
+        self.platform = platform
         self._naeusb.con(idProduct=[0xC310], serial_number=sn, hw_location=hw_location)
+        self._usart0 = USART(self._naeusb, usart_num=0)
+        self._usart1 = USART(self._naeusb, usart_num=1)
         self.pll.cdce906init()
         if fpga_id:
             target_logger.warning("fpga_id is currently unused")
@@ -237,10 +254,50 @@ class CW310(CW305):
         Returns:
             voltage (float).
         """
-        assert n in [0, 1, 8]
+        allowed_pins = [0, 1, 8]
+        if 'CW340' in self._name:
+            allowed_pins.append(12)
+        assert n in allowed_pins
         addr = n + 0x10
         raw = self._xadc_drp_read(addr)
         return (raw>>4)/4096 # ref: UG480
+
+
+    # for convenience:
+    @property
+    def max_temp(self):
+        return self.get_xadc_temp(maximum=True)
+    @property
+    def temp(self):
+        return self.get_xadc_temp()
+    @property
+    def max_vccint(self):
+        return self.get_xadc_vcc('vccint', maximum=True)
+    @property
+    def max_vccbram(self):
+        return self.get_xadc_vcc('vccbram', maximum=True)
+    @property
+    def max_vccaux(self):
+        return self.get_xadc_vcc('vccaux', maximum=True)
+    @property
+    def current_vccint(self):
+        return self.get_xadc_vcc('vccint')
+    @property
+    def current_vccbram(self):
+        return self.get_xadc_vcc('vccbram')
+    @property
+    def current_vccaux(self):
+        return self.get_xadc_vcc('vccaux')
+    @property
+    def vaux0(self):
+        return self.get_xadc_vaux(0)
+    @property
+    def vaux1(self):
+        return self.get_xadc_vaux(1)
+    @property
+    def vaux8(self):
+        return self.get_xadc_vaux(8)
+
 
     def _i2c_write(self, data):
         self._naeusb.sendCtrl(self.USB_I2C_DATA, 0, data)
@@ -370,7 +427,14 @@ class CW310(CW305):
         self._naeusb.sendCtrl(0x42, addr & 0xFF, [data_byte & 0xFF])
 
     def temp_sensor_read(self, addr):
-        return self._naeusb.readCtrl(0x42, addr & 0xFF, 2)[1]
+        resp = self._naeusb.readCtrl(0x42, addr & 0xFF, 2)
+
+        if len(resp) == 1:
+            #Flag for I2C locked
+            raise IOError("I2C locked on CW310. Try again.")
+        else:
+            print(resp)
+            return resp[1]
 
     @property
     def fpga_temp(self):

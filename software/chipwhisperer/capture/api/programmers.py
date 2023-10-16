@@ -11,6 +11,7 @@
 import logging
 from chipwhisperer.common.utils import util
 from ..scopes import ScopeTypes
+from ..scopes import CWNano
 from .cwcommon import ChipWhispererCommonInterface
 from chipwhisperer.hardware.naeusb.programmer_avr import supported_avr
 from chipwhisperer.hardware.naeusb.programmer_xmega import supported_xmega
@@ -153,8 +154,20 @@ class SAM4SProgrammer(Programmer):
         return self.prog
 
     @save_and_restore_pins
-    def find(self):
+    def find(self, power_cycle=True):
+        if power_cycle:
+            # target_logger.info("Power cycling SAM4S")
+            # self.scope.io.target_pwr = 0
+            # time.sleep(0.2)
+            # self.scope.io.target_pwr = 1
+            # time.sleep(0.2)
+            pass
         target_logger.info("Toggling erase({})/nrst pins".format(self.erase_pin))
+
+        if (self.scope.io.tio1, self.scope.io.tio2) != ("serial_rx", "serial_tx"):
+            target_logger.warning("Serial pins incorrect for NewAE SAM4S target") 
+            target_logger.warning("(tio1, tio2) != ('serial_rx', 'serial_tx')")
+            target_logger.warning("Did you forget to call scope.default_setup()?")
 
         setattr(self.scope.io, self.erase_pin, 1)
         time.sleep(0.5)
@@ -207,8 +220,12 @@ class SAM4SProgrammer(Programmer):
             prog.ser.close()
             raise OSError("Verify FAILED")
 
-    def close(self):
+    def close(self, reset=True):
         self.scope._get_usart().init(self._old_baud)
+        self.scope.io.nrst = 0
+        time.sleep(0.2)
+        self.scope.io.nrst = None
+        time.sleep(0.2)
         pass
         
     
@@ -394,6 +411,12 @@ class STM32FProgrammer(Programmer):
     def find(self):
         stm32f = self.stm32prog()
         stm32f.scope = self.scope
+        # only check this for non-Nano, as Nano can't adjust these pins
+        if not type(self.scope) is CWNano:
+            if (self.scope.io.tio1, self.scope.io.tio2) != ("serial_rx", "serial_tx"):
+                target_logger.warning("Serial pins incorrect for NewAE STM32 target") 
+                target_logger.warning("(tio1, tio2) != ('serial_rx', 'serial_tx')")
+                target_logger.warning("Did you forget to call scope.default_setup()?")
         sig, chip = stm32f.find()
 
         # logging is done at the lower level

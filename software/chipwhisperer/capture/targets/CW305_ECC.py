@@ -72,10 +72,11 @@ class CW305_ECC(CW305):
         self.default_verilog_defines_full_path = os.path.dirname(cw.__file__) +  '/../../hardware/victims/cw305_artixtarget/fpga/vivado_examples/ecc_p256_pmul/hdl/' + self.default_verilog_defines
         self.registers = 12 # number of registers we expect to find
         self.bytecount_size = 8 # pBYTECNT_SIZE in Verilog
+        self.check_done = True
         self.target_name = 'Cryptech ecdsa256-v1 pmul'
 
 
-    def capture_trace(self, scope, k, operation="pmult", Px=None, Py=None, check=True):
+    def capture_trace(self, scope, k, operation="pmult", Px=None, Py=None, check=True, as_int=False):
         """Capture a trace, running the specified test vector or operation (pmult or siggen).
 
         Does all individual steps needed to capture a trace (arming the scope,
@@ -123,7 +124,7 @@ class CW305_ECC(CW305):
                   'k': k
                   }
         textout['cycles'] = cycles
-        wave = scope.get_last_trace()
+        wave = scope.get_last_trace(as_int=as_int)
 
         if check and cycles != self.pmul_cycles:
             target_logger.warning ("Operation took %d cycles (%d more than we expect it to)" % (cycles, cycles-self.pmul_cycles))
@@ -158,7 +159,8 @@ class CW305_ECC(CW305):
         self.go()
 
         if not self.is_done():
-            target_logger.warning ("Target not done yet, increase clksleeptime!")
+            if self.platform == 'cw305' and self.clkusbautooff:
+                    target_logger.warning ("Target not done yet, increase clksleeptime!")
             #let's wait a bit more, see what happens:
             i = 0
             while not self.is_done():
