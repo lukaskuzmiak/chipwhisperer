@@ -38,17 +38,6 @@ from ..api.cwcommon import ChipWhispererCommonInterface
 
 from typing import List, Dict, Any
 
-
-ADDR_GLITCH1_DRP_ADDR  = 62
-ADDR_GLITCH1_DRP_DATA  = 63
-ADDR_GLITCH2_DRP_ADDR  = 64
-ADDR_GLITCH2_DRP_DATA  = 65
-ADDR_GLITCH1_DRP_RESET = 79
-ADDR_GLITCH2_DRP_RESET = 80
-ADDR_LA_DRP_ADDR       = 68
-ADDR_LA_DRP_DATA       = 69
-ADDR_LA_DRP_RESET      = 74
-
 CODE_READ              = 0x80
 CODE_WRITE             = 0xC0
 
@@ -93,11 +82,22 @@ class OpenADC(util.DisableNewAttr, ChipWhispererCommonInterface):
      *  :meth:`scope.get_last_trace <.OpenADC.get_last_trace>`
      *  :meth:`scope.get_serial_ports <.ChipWhispererCommonInterface.get_serial_ports>`
 
-    If you have a CW1200 ChipWhisperer Pro/Husky, you have access to some additional features:
+    If you have a CW1200 ChipWhisperer Pro, you have access to some additional features:
 
      * :attr:`scope.SAD <chipwhisperer.capture.scopes.cwhardware.ChipWhispererSAD.ChipWhispererSAD>`
      * :attr:`scope.DecodeIO <chipwhisperer.capture.scopes.cwhardware.ChipWhispererDecodeTrigger.ChipWhispererDecodeTrigger>`
      * :attr:`scope.adc.stream_mode <chipwhisperer.capture.scopes._OpenADCInterface.TriggerSettings.stream_mode>`
+
+    If you have a CW-Husky, you have access to even more additional features:
+     * :attr:`scope.SAD <chipwhisperer.capture.scopes.cwhardware.ChipWhispererSAD.HuskySAD>`
+     * :attr:`scope.LA <chipwhisperer.capture.scopes.cwhardware.ChipWhispererHuskyMisc.LASettings>`
+     * :attr:`scope.trace <chipwhisperer.capture.trace.TraceWhisperer>`
+     * :attr:`scope.UARTTrigger <chipwhisperer.capture.trace.UARTTrigger>`
+     * :attr:`scope.userio <chipwhisperer.capture.scopes.cwhardware.ChipWhispererHuskyMisc.USERIOSettings>`
+     * :attr:`scope.errors <chipwhisperer.capture.scopes.cwhardware.ChipWhispererHuskyMisc.HuskyError>`
+     * :attr:`scope.XADC <chipwhisperer.capture.scopes.cwhardware.ChipWhispererHuskyMisc.XADCSettings>`
+     * :attr:`scope.ADS4128 <chipwhisperer.capture.scopes.cwhardware.ChipWhispererHuskyMisc.ADS4128Settings>`
+     * :attr:`scope.LEDs <chipwhisperer.capture.scopes.cwhardware.ChipWhispererHuskyMisc.LEDSettings>`
 
     Inherits from :class:`chipwhisperer.capture.api.cwcommon.ChipWhispererCommonInterface`
     """
@@ -624,6 +624,8 @@ class OpenADC(util.DisableNewAttr, ChipWhispererCommonInterface):
         self.gain._clear_caches()
         self.ADS4128.set_defaults()
 
+    def _get_fpga_programmer(self):
+        return self.scopetype.fpga
 
     def con(self, sn=None, idProduct=None, bitstream=None, force=False, prog_speed=10E6, **kwargs):
         """Connects to attached chipwhisperer hardware (Lite, Pro, or Husky)
@@ -648,7 +650,7 @@ class OpenADC(util.DisableNewAttr, ChipWhispererCommonInterface):
         self.scopetype = OpenADCInterface_NAEUSBChip()
 
         self.scopetype.con(sn, idProduct, bitstream, force, prog_speed, **kwargs)
-        self.sc = OpenADCInterface(self.scopetype.ser) # important to instantiate this before other FPGA components, since this does an FPGA reset
+        self.sc = OpenADCInterface(self.scopetype.ser, self.scopetype.registers) # important to instantiate this before other FPGA components, since this does an FPGA reset
         self.hwinfo = HWInformation(self.sc)
         cwtype = self._getCWType()
         if cwtype in ["cwhusky", "cwhusky-plus"]:
@@ -677,10 +679,10 @@ class OpenADC(util.DisableNewAttr, ChipWhispererCommonInterface):
 
         if cwtype in ["cwhusky", "cwhusky-plus"]:
             # self.pll = ChipWhispererHuskyClock.CDCI6214(self.sc)
-            self._fpga_clk = ClockSettings(self.sc, hwinfo=self.hwinfo)
-            self.glitch_drp1 = XilinxDRP(self.sc, ADDR_GLITCH1_DRP_DATA, ADDR_GLITCH1_DRP_ADDR, ADDR_GLITCH1_DRP_RESET)
-            self.glitch_drp2 = XilinxDRP(self.sc, ADDR_GLITCH2_DRP_DATA, ADDR_GLITCH2_DRP_ADDR, ADDR_GLITCH2_DRP_RESET)
-            self.la_drp = XilinxDRP(self.sc, ADDR_LA_DRP_DATA, ADDR_LA_DRP_ADDR, ADDR_LA_DRP_RESET)
+            self._fpga_clk = ClockSettings(self.sc, hwinfo=self.hwinfo, is_husky=True)
+            self.glitch_drp1 = XilinxDRP(self.sc, "CG1_DRP_DATA", "CG1_DRP_ADDR", "CG1_DRP_RESET")
+            self.glitch_drp2 = XilinxDRP(self.sc, "CG2_DRP_DATA", "CG2_DRP_ADDR", "CG2_DRP_RESET")
+            self.la_drp = XilinxDRP(self.sc, "LA_DRP_DATA", "LA_DRP_ADDR", "LA_DRP_RESET")
             self.glitch_mmcm1 = XilinxMMCMDRP(self.glitch_drp1)
             self.glitch_mmcm2 = XilinxMMCMDRP(self.glitch_drp2)
             self.la_mmcm = XilinxMMCMDRP(self.la_drp)
@@ -690,13 +692,15 @@ class OpenADC(util.DisableNewAttr, ChipWhispererCommonInterface):
             self.XADC = XADCSettings(self.sc)
             self.LEDs = LEDSettings(self.sc)
             self.LA = LASettings(oaiface=self.sc, mmcm=self.la_mmcm, scope=self)
-            self.userio = USERIOSettings(self.sc)
             if TraceWhisperer:
                 try:
-                    self.trace = TraceWhisperer(husky=True, target=None, scope=self, trace_reg_select=3, main_reg_select=2)
+                    trace_reg_select = self.sc._address_str2int('TW_TRACE_REG_SELECT')
+                    main_reg_select = self.sc._address_str2int('TW_MAIN_REG_SELECT')
+                    self.trace = TraceWhisperer(husky=True, target=None, scope=self, trace_reg_select=trace_reg_select, main_reg_select=main_reg_select)
                     self.UARTTrigger = UARTTrigger(scope=self, trace_reg_select=3, main_reg_select=2)
                 except Exception as e:
                     scope_logger.info("TraceWhisperer unavailable " + str(e))
+            self.userio = USERIOSettings(self.sc, self.trace)
             self.SAD = ChipWhispererSAD.HuskySAD(self.sc)
             self.errors = HuskyErrors(self.sc, self.XADC, self.adc, self.clock, self.trace)
             self._is_husky = True
@@ -850,6 +854,9 @@ class OpenADC(util.DisableNewAttr, ChipWhispererCommonInterface):
 
         if self._is_husky and (self.adc.segments > 1) and (self.adc.samples * self.adc.segments > self.adc.oa.hwMaxSegmentSamples) and (not self.adc.stream_mode):
             raise ValueError('When using segments and stream mode is disabled, the maximum total number of samples is %d.' % self.adc.oa.hwMaxSegmentSamples)
+
+        if self._is_husky and (self.adc.samples - self.adc.presamples < 2):
+            raise ValueError('The number of samples (%d) must be at least 2 more than the number of presamples (%d).' % (self.adc.samples, self.adc.presamples))
 
         if self.adc.stream_mode and (not self._is_husky):
             a = self.sc.capture(None)
